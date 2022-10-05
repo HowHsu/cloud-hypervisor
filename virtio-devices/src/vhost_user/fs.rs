@@ -353,6 +353,7 @@ impl Fs {
             });
         }
 
+        thread::spawn(move || { virtiofsd::start_virtiofsd(); });
         // Connect to the vhost-user socket.
         let mut vu = VhostUserHandle::connect_vhost_user(false, path, num_queues as u64, false)?;
 

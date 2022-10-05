@@ -89,5 +89,6 @@ members = [
     "vm-allocator",
     "vm-device",
     "vm-migration",
-    "vm-virtio"
+    "vm-virtio",
+    "virtiofsd"
 ]
