@@ -16,6 +16,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::result;
 use std::str::FromStr;
+use std::thread;
 use thiserror::Error;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
@@ -1644,6 +1645,43 @@ impl FsConfig {
     \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
     queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>\"";
 
+    const VIRTIOFSD_ARGS: &'static [&'static str] = &[
+    "--shared-dir", "--thread-pool-size", "--xattr", "--posix-acl", "--xattrmap",
+    "--sandbox", "--seccomp", "--announce-submounts", "--inode-file-handles",
+    "--cache", "--no-readdirplus", "--writeback", "--allow-direct-io", "--print-capabilities",
+    "--modcaps", "--log-level", "--syslog", "--rlimit-nofile", "--compat-options",
+    "--compat-debug", "--no-killpriv-v2", "--killpriv-v2", "--compat-foreground",
+    "--security-label", "--socket-path", "--sandbox",
+    ];
+
+
+    fn parser_add_virtiofsd(parser: &mut OptionParser) {
+        for option in FsConfig::VIRTIOFSD_ARGS {
+            parser.add(option);
+        }
+    }
+
+    fn parse_virtiofsd(parser: &OptionParser) -> String {
+        let mut virtiofsd_args = String::new();
+
+        for i in 0..FsConfig::VIRTIOFSD_ARGS.len()-2 {
+            let key = FsConfig::VIRTIOFSD_ARGS[i];
+            if let Some(val) = parser.get(key) {
+                virtiofsd_args.push_str(&(key.to_string() + "=" + &val + ","));
+            };
+        }
+
+        let socket_path = "--socket-path".to_string() + "=" +
+                          &parser.get("socket").unwrap() + ",";
+        virtiofsd_args.push_str(&socket_path);
+
+        let sandbox_mode = "--sandbox".to_string() + "=none";
+        virtiofsd_args.push_str(&sandbox_mode);
+
+        virtiofsd_args
+    }
+
+    #[allow(unused_variables)]
     pub fn parse(fs: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -1653,7 +1691,18 @@ impl FsConfig {
             .add("socket")
             .add("id")
             .add("pci_segment");
+
+        Self::parser_add_virtiofsd(&mut parser);
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
+
+        let virtiofsd_args = Self::parse_virtiofsd(&parser);
+        if !virtiofsd_args.trim().is_empty() {
+            let res = thread::Builder::new()
+                .name("virtiofsd".to_string())
+                .spawn(move ||
+                       { virtiofsd::virtiofsd_ch::start_virtiofsd(&virtiofsd_args); }
+                );
+        }
 
         let tag = parser.get("tag").ok_or(Error::ParseFsTagMissing)?;
         let socket = PathBuf::from(parser.get("socket").ok_or(Error::ParseFsSockMissing)?);
@@ -2422,6 +2471,7 @@ impl VmConfig {
         }
 
         if let Some(fses) = &self.fs {
+            // [Hao Xu]
             if !fses.is_empty() && !self.memory.shared {
                 return Err(ValidationError::VhostUserRequiresSharedMemory);
             }
