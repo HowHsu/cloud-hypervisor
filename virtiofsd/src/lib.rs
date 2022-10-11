@@ -71,6 +71,8 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 
 mod virtiofsd;
 
-pub fn start_virtiofsd() {
-    virtiofsd::start_virtiofsd_internal();
+use std::collections::HashMap;
+
+pub fn start_virtiofsd(args: &HashMap<String,String>) {
+    virtiofsd::start_virtiofsd_internal(args);
 }

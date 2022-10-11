@@ -685,6 +685,7 @@ fn parse_compat(opt: Opt) -> Opt {
     let mut clean_opt = opt.clone();
 
     if let Some(compat_options) = opt.compat_options.as_ref() {
+        println!("compat_options");
         for line in compat_options {
             for option in line.to_string().split(',') {
                 if option.contains('=') {
@@ -829,8 +830,12 @@ fn drop_capabilities(inode_file_handles: InodeFileHandlesMode, modcaps: Option<S
     }
 }
 
-pub fn start_virtiofsd_internal() {
-    let opt = parse_compat(Opt::from_args());
+use std::collections::HashMap;
+
+pub fn start_virtiofsd_internal(args: &HashMap<String,String>) {
+    let mut args_vec = vec!["virtiofsd".to_string()];
+    args_vec.extend(args.iter().map(|(k, v)| format!("--{}={}", k, v.clone())));
+    let opt = parse_compat(Opt::from_iter(&args_vec));
 
     // Enable killpriv_v2 only if user explicitly asked for it by using
     // --killpriv-v2 or -o killpriv_v2. Otherwise disable it by default.
@@ -841,7 +846,7 @@ pub fn start_virtiofsd_internal() {
         return;
     }
 
-    initialize_logging(&opt);
+    //initialize_logging(&opt);
     set_signal_handlers();
 
     let shared_dir = match opt.shared_dir.as_ref() {

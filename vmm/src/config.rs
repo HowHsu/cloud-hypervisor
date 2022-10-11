@@ -1616,6 +1616,7 @@ pub struct FsConfig {
     pub id: Option<String>,
     #[serde(default)]
     pub pci_segment: u16,
+    pub virtiofsd_args: HashMap<String,String>,
 }
 
 fn default_fsconfig_num_queues() -> usize {
@@ -1635,6 +1636,7 @@ impl Default for FsConfig {
             queue_size: default_fsconfig_queue_size(),
             id: None,
             pci_segment: 0,
+            virtiofsd_args: HashMap::new(),
         }
     }
 }
@@ -1643,6 +1645,40 @@ impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
     \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
     queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>\"";
+
+    const VIRTIOFSD_ARGS: &'static [&'static str] = &[
+    "shared-dir", "thread-pool-size", "xattr", "posix-acl", "xattrmap",
+    "sandbox", "seccomp", "announce-submounts", "inode-file-handles",
+    "cache", "no-readdirplus", "writeback", "allow-direct-io", "print-capabilities",
+    "modcaps", "log-level", "syslog", "rlimit-nofile", "compat-options",
+    "compat-debug", "no-killpriv-v2", "killpriv-v2", "compat-foreground",
+    "security-label",
+    ];
+
+
+    fn parser_add_virtiofsd(parser: &mut OptionParser) {
+        println!("parser_add_virtiofsd");
+        for option in FsConfig::VIRTIOFSD_ARGS {
+            parser.add(("virtiofsd-".to_string() + option).as_str());
+            println!("add option: {}", option);
+        }
+    }
+
+    fn parse_virtiofsd(parser: &OptionParser) -> HashMap<String,String> {
+        let mut virtiofsd_args = HashMap::new();
+
+        println!("parse_virtiofsd");
+        for option in FsConfig::VIRTIOFSD_ARGS {
+            let key = "virtiofsd-".to_string() + option;
+            if let Some(val) = parser.get(key.as_str()) {
+                virtiofsd_args.insert(option.to_string(), val);
+            };
+        }
+        virtiofsd_args.insert("socket-path".to_string(), parser.get("socket").unwrap());
+        virtiofsd_args.insert("sandbox".to_string(), "none".to_string());
+
+        virtiofsd_args
+    }
 
     pub fn parse(fs: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1653,6 +1689,8 @@ impl FsConfig {
             .add("socket")
             .add("id")
             .add("pci_segment");
+
+        Self::parser_add_virtiofsd(&mut parser);
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
         let tag = parser.get("tag").ok_or(Error::ParseFsTagMissing)?;
@@ -1674,6 +1712,8 @@ impl FsConfig {
             .map_err(Error::ParseFileSystem)?
             .unwrap_or_default();
 
+        let virtiofsd_args = Self::parse_virtiofsd(&parser);
+
         Ok(FsConfig {
             tag,
             socket,
@@ -1681,6 +1721,7 @@ impl FsConfig {
             queue_size,
             id,
             pci_segment,
+            virtiofsd_args,
         })
     }
 
@@ -2422,6 +2463,7 @@ impl VmConfig {
         }
 
         if let Some(fses) = &self.fs {
+            // [Hao Xu]
             if !fses.is_empty() && !self.memory.shared {
                 return Err(ValidationError::VhostUserRequiresSharedMemory);
             }

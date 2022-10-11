@@ -304,6 +304,8 @@ pub struct Fs {
     iommu: bool,
 }
 
+use std::collections::HashMap;
+
 impl Fs {
     /// Create a new virtio-fs device.
     #[allow(clippy::too_many_arguments)]
@@ -313,6 +315,7 @@ impl Fs {
         tag: &str,
         req_num_queues: usize,
         queue_size: u16,
+        virtiofsd_args: HashMap<String,String>,
         cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
         seccomp_action: SeccompAction,
         restoring: bool,
@@ -353,7 +356,7 @@ impl Fs {
             });
         }
 
-        thread::spawn(move || { virtiofsd::start_virtiofsd(); });
+        let res = thread::Builder::new().name("virtiofsd".to_string()).spawn(move || { virtiofsd::start_virtiofsd(&virtiofsd_args); });
         // Connect to the vhost-user socket.
         let mut vu = VhostUserHandle::connect_vhost_user(false, path, num_queues as u64, false)?;
 
