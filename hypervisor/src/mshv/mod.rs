@@ -12,26 +12,35 @@ use crate::cpu::Vcpu;
 use crate::hypervisor;
 use crate::vec_with_array_field;
 use crate::vm::{self, InterruptSourceConfig, VmOps};
+use crate::HypervisorType;
 pub use mshv_bindings::*;
-pub use mshv_ioctls::IoEventAddress;
 use mshv_ioctls::{set_registers_64, Mshv, NoDatamatch, VcpuFd, VmFd};
-use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use vfio_ioctls::VfioDeviceFd;
 use vm::DataMatch;
 // x86_64 dependencies
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
-use crate::device;
+use crate::{
+    ClockData, CpuState, IoEventAddress, IrqRoutingEntry, MpState, UserMemoryRegion,
+    USER_MEMORY_REGION_EXECUTE, USER_MEMORY_REGION_READ, USER_MEMORY_REGION_WRITE,
+};
 use vmm_sys_util::eventfd::EventFd;
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::VcpuMshvState as CpuState;
+pub use x86_64::VcpuMshvState;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::AsRawFd;
+
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86::{
+    CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, StandardRegisters,
+};
 
 const DIRTY_BITMAP_CLEAR_DIRTY: u64 = 0x4;
 const DIRTY_BITMAP_SET_DIRTY: u64 = 0x8;
@@ -41,18 +50,108 @@ const DIRTY_BITMAP_SET_DIRTY: u64 = 0x8;
 ///
 pub use {
     mshv_bindings::mshv_create_device as CreateDevice,
-    mshv_bindings::mshv_device_attr as DeviceAttr,
-    mshv_bindings::mshv_msi_routing_entry as IrqRoutingEntry, mshv_ioctls::DeviceFd,
+    mshv_bindings::mshv_device_attr as DeviceAttr, mshv_ioctls::DeviceFd,
 };
 
 pub const PAGE_SHIFT: usize = 12;
 
-#[derive(Debug, Default, Copy, Clone, Serialize, Deserialize)]
-pub struct HvState {
-    hypercall_page: u64,
+impl From<mshv_user_mem_region> for UserMemoryRegion {
+    fn from(region: mshv_user_mem_region) -> Self {
+        let mut flags: u32 = 0;
+        if region.flags & HV_MAP_GPA_READABLE != 0 {
+            flags |= USER_MEMORY_REGION_READ;
+        }
+        if region.flags & HV_MAP_GPA_WRITABLE != 0 {
+            flags |= USER_MEMORY_REGION_WRITE;
+        }
+        if region.flags & HV_MAP_GPA_EXECUTABLE != 0 {
+            flags |= USER_MEMORY_REGION_EXECUTE;
+        }
+
+        UserMemoryRegion {
+            guest_phys_addr: (region.guest_pfn << PAGE_SHIFT as u64)
+                + (region.userspace_addr & ((1 << PAGE_SHIFT) - 1)),
+            memory_size: region.size,
+            userspace_addr: region.userspace_addr,
+            flags,
+            ..Default::default()
+        }
+    }
 }
 
-pub use HvState as VmState;
+impl From<UserMemoryRegion> for mshv_user_mem_region {
+    fn from(region: UserMemoryRegion) -> Self {
+        let mut flags: u32 = 0;
+        if region.flags & USER_MEMORY_REGION_READ != 0 {
+            flags |= HV_MAP_GPA_READABLE;
+        }
+        if region.flags & USER_MEMORY_REGION_WRITE != 0 {
+            flags |= HV_MAP_GPA_WRITABLE;
+        }
+        if region.flags & USER_MEMORY_REGION_EXECUTE != 0 {
+            flags |= HV_MAP_GPA_EXECUTABLE;
+        }
+
+        mshv_user_mem_region {
+            guest_pfn: region.guest_phys_addr >> PAGE_SHIFT,
+            size: region.memory_size,
+            userspace_addr: region.userspace_addr,
+            flags,
+        }
+    }
+}
+
+impl From<mshv_ioctls::IoEventAddress> for IoEventAddress {
+    fn from(a: mshv_ioctls::IoEventAddress) -> Self {
+        match a {
+            mshv_ioctls::IoEventAddress::Pio(x) => Self::Pio(x),
+            mshv_ioctls::IoEventAddress::Mmio(x) => Self::Mmio(x),
+        }
+    }
+}
+
+impl From<IoEventAddress> for mshv_ioctls::IoEventAddress {
+    fn from(a: IoEventAddress) -> Self {
+        match a {
+            IoEventAddress::Pio(x) => Self::Pio(x),
+            IoEventAddress::Mmio(x) => Self::Mmio(x),
+        }
+    }
+}
+
+impl From<VcpuMshvState> for CpuState {
+    fn from(s: VcpuMshvState) -> Self {
+        CpuState::Mshv(s)
+    }
+}
+
+impl From<CpuState> for VcpuMshvState {
+    fn from(s: CpuState) -> Self {
+        match s {
+            CpuState::Mshv(s) => s,
+            /* Needed in case other hypervisors are enabled */
+            #[allow(unreachable_patterns)]
+            _ => panic!("CpuState is not valid"),
+        }
+    }
+}
+
+impl From<mshv_msi_routing_entry> for IrqRoutingEntry {
+    fn from(s: mshv_msi_routing_entry) -> Self {
+        IrqRoutingEntry::Mshv(s)
+    }
+}
+
+impl From<IrqRoutingEntry> for mshv_msi_routing_entry {
+    fn from(e: IrqRoutingEntry) -> Self {
+        match e {
+            IrqRoutingEntry::Mshv(e) => e,
+            /* Needed in case other hypervisors are enabled */
+            #[allow(unreachable_patterns)]
+            _ => panic!("IrqRoutingEntry is not valid"),
+        }
+    }
+}
 
 struct MshvDirtyLogSlot {
     guest_pfn: u64,
@@ -65,11 +164,34 @@ pub struct MshvHypervisor {
 }
 
 impl MshvHypervisor {
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Retrieve the list of MSRs supported by MSHV.
+    ///
+    fn get_msr_list(&self) -> hypervisor::Result<MsrList> {
+        self.mshv
+            .get_msr_index_list()
+            .map_err(|e| hypervisor::HypervisorError::GetMsrList(e.into()))
+    }
+}
+
+impl MshvHypervisor {
     /// Create a hypervisor based on Mshv
-    pub fn new() -> hypervisor::Result<MshvHypervisor> {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> hypervisor::Result<Arc<dyn hypervisor::Hypervisor>> {
         let mshv_obj =
             Mshv::new().map_err(|e| hypervisor::HypervisorError::HypervisorCreate(e.into()))?;
-        Ok(MshvHypervisor { mshv: mshv_obj })
+        Ok(Arc::new(MshvHypervisor { mshv: mshv_obj }))
+    }
+    /// Check if the hypervisor is available
+    pub fn is_available() -> hypervisor::Result<bool> {
+        match std::fs::metadata("/dev/mshv") {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(hypervisor::HypervisorError::HypervisorAvailableCheck(
+                err.into(),
+            )),
+        }
     }
 }
 /// Implementation of Hypervisor trait for Mshv
@@ -81,6 +203,12 @@ impl MshvHypervisor {
 /// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
 ///
 impl hypervisor::Hypervisor for MshvHypervisor {
+    ///
+    /// Returns the type of the hypervisor
+    ///
+    fn hypervisor_type(&self) -> HypervisorType {
+        HypervisorType::Mshv
+    }
     /// Create a mshv vm object and return the object as Vm trait object
     /// Example
     /// # extern crate hypervisor;
@@ -121,47 +249,38 @@ impl hypervisor::Hypervisor for MshvHypervisor {
 
         let msr_list = self.get_msr_list()?;
         let num_msrs = msr_list.as_fam_struct_ref().nmsrs as usize;
-        let mut msrs = MsrEntries::new(num_msrs).unwrap();
+        let mut msrs: Vec<MsrEntry> = vec![
+            MsrEntry {
+                ..Default::default()
+            };
+            num_msrs
+        ];
         let indices = msr_list.as_slice();
-        let msr_entries = msrs.as_mut_slice();
         for (pos, index) in indices.iter().enumerate() {
-            msr_entries[pos].index = *index;
+            msrs[pos].index = *index;
         }
         let vm_fd = Arc::new(fd);
 
         Ok(Arc::new(MshvVm {
             fd: vm_fd,
             msrs,
-            hv_state: hv_state_init(),
-            vm_ops: None,
             dirty_log_slots: Arc::new(RwLock::new(HashMap::new())),
         }))
     }
     ///
     /// Get the supported CpuID
     ///
-    fn get_cpuid(&self) -> hypervisor::Result<CpuId> {
-        Ok(CpuId::new(1).unwrap())
-    }
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// Retrieve the list of MSRs supported by MSHV.
-    ///
-    fn get_msr_list(&self) -> hypervisor::Result<MsrList> {
-        self.mshv
-            .get_msr_index_list()
-            .map_err(|e| hypervisor::HypervisorError::GetMsrList(e.into()))
+    fn get_cpuid(&self) -> hypervisor::Result<Vec<CpuIdEntry>> {
+        Ok(Vec::new())
     }
 }
 
-#[allow(dead_code)]
 /// Vcpu struct for Microsoft Hypervisor
 pub struct MshvVcpu {
     fd: VcpuFd,
     vp_index: u8,
-    cpuid: CpuId,
-    msrs: MsrEntries,
-    hv_state: Arc<RwLock<HvState>>, // Mshv State
+    cpuid: Vec<CpuIdEntry>,
+    msrs: Vec<MsrEntry>,
     vm_ops: Option<Arc<dyn vm::VmOps>>,
 }
 
@@ -181,17 +300,20 @@ impl cpu::Vcpu for MshvVcpu {
     /// Returns the vCPU general purpose registers.
     ///
     fn get_regs(&self) -> cpu::Result<StandardRegisters> {
-        self.fd
+        Ok(self
+            .fd
             .get_regs()
-            .map_err(|e| cpu::HypervisorCpuError::GetStandardRegs(e.into()))
+            .map_err(|e| cpu::HypervisorCpuError::GetStandardRegs(e.into()))?
+            .into())
     }
     #[cfg(target_arch = "x86_64")]
     ///
     /// Sets the vCPU general purpose registers.
     ///
     fn set_regs(&self, regs: &StandardRegisters) -> cpu::Result<()> {
+        let regs = (*regs).into();
         self.fd
-            .set_regs(regs)
+            .set_regs(&regs)
             .map_err(|e| cpu::HypervisorCpuError::SetStandardRegs(e.into()))
     }
     #[cfg(target_arch = "x86_64")]
@@ -199,17 +321,20 @@ impl cpu::Vcpu for MshvVcpu {
     /// Returns the vCPU special registers.
     ///
     fn get_sregs(&self) -> cpu::Result<SpecialRegisters> {
-        self.fd
+        Ok(self
+            .fd
             .get_sregs()
-            .map_err(|e| cpu::HypervisorCpuError::GetSpecialRegs(e.into()))
+            .map_err(|e| cpu::HypervisorCpuError::GetSpecialRegs(e.into()))?
+            .into())
     }
     #[cfg(target_arch = "x86_64")]
     ///
     /// Sets the vCPU special registers.
     ///
     fn set_sregs(&self, sregs: &SpecialRegisters) -> cpu::Result<()> {
+        let sregs = (*sregs).into();
         self.fd
-            .set_sregs(sregs)
+            .set_sregs(&sregs)
             .map_err(|e| cpu::HypervisorCpuError::SetSpecialRegs(e.into()))
     }
     #[cfg(target_arch = "x86_64")]
@@ -217,17 +342,20 @@ impl cpu::Vcpu for MshvVcpu {
     /// Returns the floating point state (FPU) from the vCPU.
     ///
     fn get_fpu(&self) -> cpu::Result<FpuState> {
-        self.fd
+        Ok(self
+            .fd
             .get_fpu()
-            .map_err(|e| cpu::HypervisorCpuError::GetFloatingPointRegs(e.into()))
+            .map_err(|e| cpu::HypervisorCpuError::GetFloatingPointRegs(e.into()))?
+            .into())
     }
     #[cfg(target_arch = "x86_64")]
     ///
     /// Set the floating point state (FPU) of a vCPU.
     ///
     fn set_fpu(&self, fpu: &FpuState) -> cpu::Result<()> {
+        let fpu: mshv_bindings::FloatingPointUnit = (*fpu).clone().into();
         self.fd
-            .set_fpu(fpu)
+            .set_fpu(&fpu)
             .map_err(|e| cpu::HypervisorCpuError::SetFloatingPointRegs(e.into()))
     }
 
@@ -235,60 +363,36 @@ impl cpu::Vcpu for MshvVcpu {
     ///
     /// Returns the model-specific registers (MSR) for this vCPU.
     ///
-    fn get_msrs(&self, msrs: &mut MsrEntries) -> cpu::Result<usize> {
-        self.fd
-            .get_msrs(msrs)
-            .map_err(|e| cpu::HypervisorCpuError::GetMsrEntries(e.into()))
+    fn get_msrs(&self, msrs: &mut Vec<MsrEntry>) -> cpu::Result<usize> {
+        let mshv_msrs: Vec<msr_entry> = msrs.iter().map(|e| (*e).into()).collect();
+        let mut mshv_msrs = MsrEntries::from_entries(&mshv_msrs).unwrap();
+        let succ = self
+            .fd
+            .get_msrs(&mut mshv_msrs)
+            .map_err(|e| cpu::HypervisorCpuError::GetMsrEntries(e.into()))?;
+
+        msrs[..succ].copy_from_slice(
+            &mshv_msrs.as_slice()[..succ]
+                .iter()
+                .map(|e| (*e).into())
+                .collect::<Vec<MsrEntry>>(),
+        );
+
+        Ok(succ)
     }
     #[cfg(target_arch = "x86_64")]
     ///
     /// Setup the model-specific registers (MSR) for this vCPU.
     /// Returns the number of MSR entries actually written.
     ///
-    fn set_msrs(&self, msrs: &MsrEntries) -> cpu::Result<usize> {
+    fn set_msrs(&self, msrs: &[MsrEntry]) -> cpu::Result<usize> {
+        let mshv_msrs: Vec<msr_entry> = msrs.iter().map(|e| (*e).into()).collect();
+        let mshv_msrs = MsrEntries::from_entries(&mshv_msrs).unwrap();
         self.fd
-            .set_msrs(msrs)
+            .set_msrs(&mshv_msrs)
             .map_err(|e| cpu::HypervisorCpuError::SetMsrEntries(e.into()))
     }
 
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// X86 specific call that returns the vcpu's current "xcrs".
-    ///
-    fn get_xcrs(&self) -> cpu::Result<ExtendedControlRegisters> {
-        self.fd
-            .get_xcrs()
-            .map_err(|e| cpu::HypervisorCpuError::GetXcsr(e.into()))
-    }
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// X86 specific call that sets the vcpu's current "xcrs".
-    ///
-    fn set_xcrs(&self, xcrs: &ExtendedControlRegisters) -> cpu::Result<()> {
-        self.fd
-            .set_xcrs(xcrs)
-            .map_err(|e| cpu::HypervisorCpuError::SetXcsr(e.into()))
-    }
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// Returns currently pending exceptions, interrupts, and NMIs as well as related
-    /// states of the vcpu.
-    ///
-    fn get_vcpu_events(&self) -> cpu::Result<VcpuEvents> {
-        self.fd
-            .get_vcpu_events()
-            .map_err(|e| cpu::HypervisorCpuError::GetVcpuEvents(e.into()))
-    }
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// Sets pending exceptions, interrupts, and NMIs as well as related states
-    /// of the vcpu.
-    ///
-    fn set_vcpu_events(&self, events: &VcpuEvents) -> cpu::Result<()> {
-        self.fd
-            .set_vcpu_events(events)
-            .map_err(|e| cpu::HypervisorCpuError::SetVcpuEvents(e.into()))
-    }
     #[cfg(target_arch = "x86_64")]
     ///
     /// X86 specific call to enable HyperV SynIC
@@ -463,14 +567,14 @@ impl cpu::Vcpu for MshvVcpu {
     ///
     /// X86 specific call to setup the CPUID registers.
     ///
-    fn set_cpuid2(&self, _cpuid: &CpuId) -> cpu::Result<()> {
+    fn set_cpuid2(&self, _cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
         Ok(())
     }
     #[cfg(target_arch = "x86_64")]
     ///
     /// X86 specific call to retrieve the CPUID registers.
     ///
-    fn get_cpuid2(&self, _num_entries: usize) -> cpu::Result<CpuId> {
+    fn get_cpuid2(&self, _num_entries: usize) -> cpu::Result<Vec<CpuIdEntry>> {
         Ok(self.cpuid.clone())
     }
     #[cfg(target_arch = "x86_64")]
@@ -478,45 +582,43 @@ impl cpu::Vcpu for MshvVcpu {
     /// Returns the state of the LAPIC (Local Advanced Programmable Interrupt Controller).
     ///
     fn get_lapic(&self) -> cpu::Result<LapicState> {
-        self.fd
+        Ok(self
+            .fd
             .get_lapic()
-            .map_err(|e| cpu::HypervisorCpuError::GetlapicState(e.into()))
+            .map_err(|e| cpu::HypervisorCpuError::GetlapicState(e.into()))?
+            .into())
     }
     #[cfg(target_arch = "x86_64")]
     ///
     /// Sets the state of the LAPIC (Local Advanced Programmable Interrupt Controller).
     ///
     fn set_lapic(&self, lapic: &LapicState) -> cpu::Result<()> {
+        let lapic: mshv_bindings::LapicState = (*lapic).clone().into();
         self.fd
-            .set_lapic(lapic)
+            .set_lapic(&lapic)
             .map_err(|e| cpu::HypervisorCpuError::SetLapicState(e.into()))
     }
-    #[cfg(target_arch = "x86_64")]
     ///
-    /// X86 specific call that returns the vcpu's current "xsave struct".
+    /// Returns the vcpu's current "multiprocessing state".
     ///
-    fn get_xsave(&self) -> cpu::Result<Xsave> {
-        self.fd
-            .get_xsave()
-            .map_err(|e| cpu::HypervisorCpuError::GetXsaveState(e.into()))
+    fn get_mp_state(&self) -> cpu::Result<MpState> {
+        Ok(MpState::Mshv)
     }
-    #[cfg(target_arch = "x86_64")]
     ///
-    /// X86 specific call that sets the vcpu's current "xsave struct".
+    /// Sets the vcpu's current "multiprocessing state".
     ///
-    fn set_xsave(&self, xsave: &Xsave) -> cpu::Result<()> {
-        self.fd
-            .set_xsave(xsave)
-            .map_err(|e| cpu::HypervisorCpuError::SetXsaveState(e.into()))
+    fn set_mp_state(&self, _mp_state: MpState) -> cpu::Result<()> {
+        Ok(())
     }
     ///
     /// Set CPU state
     ///
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
+        let state: VcpuMshvState = state.clone().into();
         self.set_msrs(&state.msrs)?;
         self.set_vcpu_events(&state.vcpu_events)?;
-        self.set_regs(&state.regs)?;
-        self.set_sregs(&state.sregs)?;
+        self.set_regs(&state.regs.into())?;
+        self.set_sregs(&state.sregs.into())?;
         self.set_fpu(&state.fpu)?;
         self.set_xcrs(&state.xcrs)?;
         self.set_lapic(&state.lapic)?;
@@ -555,18 +657,19 @@ impl cpu::Vcpu for MshvVcpu {
             .get_debug_regs()
             .map_err(|e| cpu::HypervisorCpuError::GetDebugRegs(e.into()))?;
 
-        Ok(CpuState {
+        Ok(VcpuMshvState {
             msrs,
             vcpu_events,
-            regs,
-            sregs,
+            regs: regs.into(),
+            sregs: sregs.into(),
             fpu,
             xcrs,
             lapic,
             dbg,
             xsave,
             misc,
-        })
+        }
+        .into())
     }
     #[cfg(target_arch = "x86_64")]
     ///
@@ -586,42 +689,83 @@ impl cpu::Vcpu for MshvVcpu {
     }
     #[cfg(target_arch = "x86_64")]
     ///
-    /// X86 specific call that returns the vcpu's current "suspend registers".
+    /// Return the list of initial MSR entries for a VCPU
     ///
-    fn get_suspend_regs(&self) -> cpu::Result<SuspendRegisters> {
-        self.fd
-            .get_suspend_regs()
-            .map_err(|e| cpu::HypervisorCpuError::GetSuspendRegs(e.into()))
+    fn boot_msr_entries(&self) -> Vec<MsrEntry> {
+        use crate::arch::x86::{msr_index, MTRR_ENABLE, MTRR_MEM_TYPE_WB};
+
+        [
+            msr!(msr_index::MSR_IA32_SYSENTER_CS),
+            msr!(msr_index::MSR_IA32_SYSENTER_ESP),
+            msr!(msr_index::MSR_IA32_SYSENTER_EIP),
+            msr!(msr_index::MSR_STAR),
+            msr!(msr_index::MSR_CSTAR),
+            msr!(msr_index::MSR_LSTAR),
+            msr!(msr_index::MSR_KERNEL_GS_BASE),
+            msr!(msr_index::MSR_SYSCALL_MASK),
+            msr!(msr_index::MSR_IA32_TSC),
+            msr_data!(msr_index::MSR_MTRRdefType, MTRR_ENABLE | MTRR_MEM_TYPE_WB),
+        ]
+        .to_vec()
     }
 }
 
-/// Device struct for MSHV
-pub struct MshvDevice {
-    fd: DeviceFd,
-}
-
-impl device::Device for MshvDevice {
+impl MshvVcpu {
+    #[cfg(target_arch = "x86_64")]
     ///
-    /// Set device attribute
+    /// X86 specific call that returns the vcpu's current "xsave struct".
     ///
-    fn set_device_attr(&self, attr: &DeviceAttr) -> device::Result<()> {
+    fn get_xsave(&self) -> cpu::Result<Xsave> {
         self.fd
-            .set_device_attr(attr)
-            .map_err(|e| device::HypervisorDeviceError::SetDeviceAttribute(e.into()))
+            .get_xsave()
+            .map_err(|e| cpu::HypervisorCpuError::GetXsaveState(e.into()))
     }
+    #[cfg(target_arch = "x86_64")]
     ///
-    /// Get device attribute
+    /// X86 specific call that sets the vcpu's current "xsave struct".
     ///
-    fn get_device_attr(&self, attr: &mut DeviceAttr) -> device::Result<()> {
+    fn set_xsave(&self, xsave: &Xsave) -> cpu::Result<()> {
         self.fd
-            .get_device_attr(attr)
-            .map_err(|e| device::HypervisorDeviceError::GetDeviceAttribute(e.into()))
+            .set_xsave(xsave)
+            .map_err(|e| cpu::HypervisorCpuError::SetXsaveState(e.into()))
     }
-}
-
-impl AsRawFd for MshvDevice {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// X86 specific call that returns the vcpu's current "xcrs".
+    ///
+    fn get_xcrs(&self) -> cpu::Result<ExtendedControlRegisters> {
+        self.fd
+            .get_xcrs()
+            .map_err(|e| cpu::HypervisorCpuError::GetXcsr(e.into()))
+    }
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// X86 specific call that sets the vcpu's current "xcrs".
+    ///
+    fn set_xcrs(&self, xcrs: &ExtendedControlRegisters) -> cpu::Result<()> {
+        self.fd
+            .set_xcrs(xcrs)
+            .map_err(|e| cpu::HypervisorCpuError::SetXcsr(e.into()))
+    }
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Returns currently pending exceptions, interrupts, and NMIs as well as related
+    /// states of the vcpu.
+    ///
+    fn get_vcpu_events(&self) -> cpu::Result<VcpuEvents> {
+        self.fd
+            .get_vcpu_events()
+            .map_err(|e| cpu::HypervisorCpuError::GetVcpuEvents(e.into()))
+    }
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Sets pending exceptions, interrupts, and NMIs as well as related states
+    /// of the vcpu.
+    ///
+    fn set_vcpu_events(&self, events: &VcpuEvents) -> cpu::Result<()> {
+        self.fd
+            .set_vcpu_events(events)
+            .map_err(|e| cpu::HypervisorCpuError::SetVcpuEvents(e.into()))
     }
 }
 
@@ -750,19 +894,25 @@ impl<'a> PlatformEmulator for MshvEmulatorContext<'a> {
     }
 }
 
-#[allow(dead_code)]
 /// Wrapper over Mshv VM ioctls.
 pub struct MshvVm {
     fd: Arc<VmFd>,
-    msrs: MsrEntries,
-    // Hypervisor State
-    hv_state: Arc<RwLock<HvState>>,
-    vm_ops: Option<Arc<dyn vm::VmOps>>,
+    msrs: Vec<MsrEntry>,
     dirty_log_slots: Arc<RwLock<HashMap<u64, MshvDirtyLogSlot>>>,
 }
 
-fn hv_state_init() -> Arc<RwLock<HvState>> {
-    Arc::new(RwLock::new(HvState { hypercall_page: 0 }))
+impl MshvVm {
+    ///
+    /// Creates an in-kernel device.
+    ///
+    /// See the documentation for `MSHV_CREATE_DEVICE`.
+    fn create_device(&self, device: &mut CreateDevice) -> vm::Result<VfioDeviceFd> {
+        let device_fd = self
+            .fd
+            .create_device(device)
+            .map_err(|e| vm::HypervisorVmError::CreateDevice(e.into()))?;
+        Ok(VfioDeviceFd::new_from_mshv(device_fd))
+    }
 }
 
 ///
@@ -836,9 +986,8 @@ impl vm::Vm for MshvVm {
         let vcpu = MshvVcpu {
             fd: vcpu_fd,
             vp_index: id,
-            cpuid: CpuId::new(1).unwrap(),
+            cpuid: Vec::new(),
             msrs: self.msrs.clone(),
-            hv_state: self.hv_state.clone(),
             vm_ops,
         };
         Ok(Arc::new(vcpu))
@@ -857,6 +1006,7 @@ impl vm::Vm for MshvVm {
         addr: &IoEventAddress,
         datamatch: Option<DataMatch>,
     ) -> vm::Result<()> {
+        let addr = &mshv_ioctls::IoEventAddress::from(*addr);
         debug!(
             "register_ioevent fd {} addr {:x?} datamatch {:?}",
             fd.as_raw_fd(),
@@ -882,6 +1032,7 @@ impl vm::Vm for MshvVm {
     }
     /// Unregister an event from a certain address it has been previously registered to.
     fn unregister_ioevent(&self, fd: &EventFd, addr: &IoEventAddress) -> vm::Result<()> {
+        let addr = &mshv_ioctls::IoEventAddress::from(*addr);
         debug!("unregister_ioevent fd {} addr {:x?}", fd.as_raw_fd(), addr);
 
         self.fd
@@ -890,7 +1041,8 @@ impl vm::Vm for MshvVm {
     }
 
     /// Creates a guest physical memory region.
-    fn create_user_memory_region(&self, user_memory_region: MemoryRegion) -> vm::Result<()> {
+    fn create_user_memory_region(&self, user_memory_region: UserMemoryRegion) -> vm::Result<()> {
+        let user_memory_region: mshv_user_mem_region = user_memory_region.into();
         // No matter read only or not we keep track the slots.
         // For readonly hypervisor can enable the dirty bits,
         // but a VM exit happens before setting the dirty bits
@@ -909,7 +1061,8 @@ impl vm::Vm for MshvVm {
     }
 
     /// Removes a guest physical memory region.
-    fn remove_user_memory_region(&self, user_memory_region: MemoryRegion) -> vm::Result<()> {
+    fn remove_user_memory_region(&self, user_memory_region: UserMemoryRegion) -> vm::Result<()> {
+        let user_memory_region: mshv_user_mem_region = user_memory_region.into();
         // Remove the corresponding entry from "self.dirty_log_slots" if needed
         self.dirty_log_slots
             .write()
@@ -930,7 +1083,7 @@ impl vm::Vm for MshvVm {
         userspace_addr: u64,
         readonly: bool,
         _log_dirty_pages: bool,
-    ) -> MemoryRegion {
+    ) -> UserMemoryRegion {
         let mut flags = HV_MAP_GPA_READABLE | HV_MAP_GPA_EXECUTABLE;
         if !readonly {
             flags |= HV_MAP_GPA_WRITABLE;
@@ -942,22 +1095,10 @@ impl vm::Vm for MshvVm {
             size: memory_size,
             userspace_addr: userspace_addr as u64,
         }
+        .into()
     }
 
-    ///
-    /// Creates an in-kernel device.
-    ///
-    /// See the documentation for `MSHV_CREATE_DEVICE`.
-    fn create_device(&self, device: &mut CreateDevice) -> vm::Result<Arc<dyn device::Device>> {
-        let fd = self
-            .fd
-            .create_device(device)
-            .map_err(|e| vm::HypervisorVmError::CreateDevice(e.into()))?;
-        let device = MshvDevice { fd };
-        Ok(Arc::new(device))
-    }
-
-    fn create_passthrough_device(&self) -> vm::Result<Arc<dyn device::Device>> {
+    fn create_passthrough_device(&self) -> vm::Result<VfioDeviceFd> {
         let mut vfio_dev = mshv_create_device {
             type_: mshv_device_type_MSHV_DEV_TYPE_VFIO,
             fd: 0,
@@ -971,18 +1112,15 @@ impl vm::Vm for MshvVm {
     ///
     /// Constructs a routing entry
     ///
-    fn make_routing_entry(
-        &self,
-        gsi: u32,
-        config: &InterruptSourceConfig,
-    ) -> mshv_msi_routing_entry {
+    fn make_routing_entry(&self, gsi: u32, config: &InterruptSourceConfig) -> IrqRoutingEntry {
         match config {
             InterruptSourceConfig::MsiIrq(cfg) => mshv_msi_routing_entry {
                 gsi,
                 address_lo: cfg.low_addr,
                 address_hi: cfg.high_addr,
                 data: cfg.data,
-            },
+            }
+            .into(),
             _ => {
                 unreachable!()
             }
@@ -994,31 +1132,27 @@ impl vm::Vm for MshvVm {
             vec_with_array_field::<mshv_msi_routing, mshv_msi_routing_entry>(entries.len());
         msi_routing[0].nr = entries.len() as u32;
 
+        let entries: Vec<mshv_msi_routing_entry> = entries
+            .iter()
+            .map(|entry| match entry {
+                IrqRoutingEntry::Mshv(e) => *e,
+                #[allow(unreachable_patterns)]
+                _ => panic!("IrqRoutingEntry type is wrong"),
+            })
+            .collect();
+
         // SAFETY: msi_routing initialized with entries.len() and now it is being turned into
         // entries_slice with entries.len() again. It is guaranteed to be large enough to hold
         // everything from entries.
         unsafe {
             let entries_slice: &mut [mshv_msi_routing_entry] =
                 msi_routing[0].entries.as_mut_slice(entries.len());
-            entries_slice.copy_from_slice(entries);
+            entries_slice.copy_from_slice(&entries);
         }
 
         self.fd
             .set_msi_routing(&msi_routing[0])
             .map_err(|e| vm::HypervisorVmError::SetGsiRouting(e.into()))
-    }
-    ///
-    /// Get the Vm state. Return VM specific data
-    ///
-    fn state(&self) -> vm::Result<VmState> {
-        Ok(*self.hv_state.read().unwrap())
-    }
-    ///
-    /// Set the VM state
-    ///
-    fn set_state(&self, state: VmState) -> vm::Result<()> {
-        self.hv_state.write().unwrap().hypercall_page = state.hypercall_page;
-        Ok(())
     }
     ///
     /// Start logging dirty pages
@@ -1057,5 +1191,19 @@ impl vm::Vm for MshvVm {
                 DIRTY_BITMAP_CLEAR_DIRTY,
             )
             .map_err(|e| vm::HypervisorVmError::GetDirtyLog(e.into()))
+    }
+    /// Retrieve guest clock.
+    #[cfg(target_arch = "x86_64")]
+    fn get_clock(&self) -> vm::Result<ClockData> {
+        Ok(ClockData::Mshv)
+    }
+    /// Set guest clock.
+    #[cfg(target_arch = "x86_64")]
+    fn set_clock(&self, _data: &ClockData) -> vm::Result<()> {
+        Ok(())
+    }
+    /// Downcast to the underlying MshvVm type
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }

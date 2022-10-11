@@ -61,7 +61,8 @@ meaning it will be printing guest kernel logs to the `virtio-console` device.
 
 ```bash
 ./cloud-hypervisor \
-    --tdx firmware=edk2-staging/Build/OvmfCh/RELEASE_GCC5/FV/OVMF.fd \
+    --platform tdx=on
+    --firmware edk2-staging/Build/OvmfCh/RELEASE_GCC5/FV/OVMF.fd \
     --cpus boot=1 \
     --memory size=1G \
     --disk path=tdx_guest_img
@@ -72,7 +73,8 @@ firmware:
 
 ```bash
 ./cloud-hypervisor \
-    --tdx firmware=edk2-staging/Build/OvmfCh/DEBUG_GCC5/FV/OVMF.fd \
+    --platform tdx=on
+    --firmware edk2-staging/Build/OvmfCh/DEBUG_GCC5/FV/OVMF.fd \
     --cpus boot=1 \
     --memory size=1G \
     --disk path=tdx_guest_img \
@@ -95,7 +97,8 @@ option as well.
 
 ```bash
 ./cloud-hypervisor \
-    --tdx firmware=tdshim \
+    --platform tdx=on
+    --firmware tdshim \
     --kernel bzImage \
     --cmdline "root=/dev/vda3 console=hvc0 rw"
     --cpus boot=1 \
@@ -103,8 +106,18 @@ option as well.
     --disk path=tdx_guest_img
 ```
 
-### Guest kernel disables serial ports
+### Guest kernel limitations
+
+#### Serial ports disabled
 
 The latest guest kernel that can be found in the latest image
 `td-guest-rhel8.5.raw` disabled the support for serial ports. This means adding
 `console=ttyS0` will have no effect and will not print any log from the guest.
+
+#### PCI hotplug through ACPI
+
+Unless you run the guest kernel with the parameter `tdx_disable_filter`, ACPI
+devices responsible for handling PCI hotplug (PCI hotplug controller, PCI
+Express Bus and Generic Event Device) will not be allowed, therefore the
+corresponding drivers will not be loaded and the PCI hotplug feature will not
+be supported.

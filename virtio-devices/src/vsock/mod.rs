@@ -170,7 +170,7 @@ mod tests {
     use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
-    use virtio_queue::{defs::VIRTQ_DESC_F_NEXT, defs::VIRTQ_DESC_F_WRITE};
+    use virtio_bindings::bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use vm_memory::{GuestAddress, GuestMemoryAtomic};
     use vm_virtio::queue::testing::VirtQueue as GuestQ;
     use vmm_sys_util::eventfd::EventFd;
@@ -295,15 +295,20 @@ mod tests {
             guest_rxvq.dtable[0].set(
                 0x0040_0000,
                 VSOCK_PKT_HDR_SIZE as u32,
-                VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT,
+                (VRING_DESC_F_WRITE | VRING_DESC_F_NEXT).try_into().unwrap(),
                 1,
             );
-            guest_rxvq.dtable[1].set(0x0040_1000, 4096, VIRTQ_DESC_F_WRITE, 0);
+            guest_rxvq.dtable[1].set(0x0040_1000, 4096, VRING_DESC_F_WRITE.try_into().unwrap(), 0);
             guest_rxvq.avail.ring[0].set(0);
             guest_rxvq.avail.idx.set(1);
 
             // Set up one available descriptor in the TX queue.
-            guest_txvq.dtable[0].set(0x0050_0000, VSOCK_PKT_HDR_SIZE as u32, VIRTQ_DESC_F_NEXT, 1);
+            guest_txvq.dtable[0].set(
+                0x0050_0000,
+                VSOCK_PKT_HDR_SIZE as u32,
+                VRING_DESC_F_NEXT.try_into().unwrap(),
+                1,
+            );
             guest_txvq.dtable[1].set(0x0050_1000, 4096, 0, 0);
             guest_txvq.avail.ring[0].set(0);
             guest_txvq.avail.idx.set(1);
@@ -348,7 +353,7 @@ mod tests {
             let event = epoll::Event::new(events, TX_QUEUE_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
-            self.handler.handle_event(&mut epoll_helper, &event);
+            self.handler.handle_event(&mut epoll_helper, &event).ok();
         }
         pub fn signal_rxq_event(&mut self) {
             self.handler.queue_evts[0].write(1).unwrap();
@@ -356,7 +361,7 @@ mod tests {
             let event = epoll::Event::new(events, RX_QUEUE_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&self.handler.kill_evt, &self.handler.pause_evt).unwrap();
-            self.handler.handle_event(&mut epoll_helper, &event);
+            self.handler.handle_event(&mut epoll_helper, &event).ok();
         }
     }
 }

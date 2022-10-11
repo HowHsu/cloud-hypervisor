@@ -29,10 +29,11 @@ mkdir /tmp/shared_dir
 _Run virtiofsd_
 ```bash
 ./virtiofsd \
-    -d \
+    --log-level debug \
     --socket-path=/tmp/virtiofs \
     --shared-dir=/tmp/shared_dir \
-    --cache=never
+    --cache=never \
+    --thread-pool-size=$N
 ```
 
 The `cache=never` option is the default when using `virtiofsd` with
@@ -43,6 +44,10 @@ machines that can be launched on a single host.
 The `cache=always` option will allow the host page cache to be used, which can
 result in better performance for the guest's workload at the cost of increasing
 the footprint on host memory.
+
+The `thread-pool-size` option controls how many IO threads are spawned. For
+very fast storage like NVMe spawning enough worker threads is critical to
+getting an acceptable performance compared to native.
 
 ### Kernel support
 

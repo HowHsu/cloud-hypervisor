@@ -29,17 +29,10 @@ use vmm_sys_util::terminal::Terminal;
 enum Error {
     #[error("Failed to create API EventFd: {0}")]
     CreateApiEventFd(#[source] std::io::Error),
-    #[cfg(feature = "gdb")]
+    #[cfg(feature = "guest_debug")]
     #[error("Failed to create Debug EventFd: {0}")]
     CreateDebugEventFd(#[source] std::io::Error),
-    #[cfg_attr(
-        feature = "kvm",
-        error("Failed to open hypervisor interface (is /dev/kvm available?): {0}")
-    )]
-    #[cfg_attr(
-        feature = "mshv",
-        error("Failed to open hypervisor interface (is /dev/mshv available?): {0}")
-    )]
+    #[error("Failed to open hypervisor interface (is hypervisor interface available?): {0}")]
     CreateHypervisor(#[source] hypervisor::HypervisorError),
     #[error("Failed to start the VMM thread: {0}")]
     StartVmmThread(#[source] vmm::Error),
@@ -65,10 +58,10 @@ enum Error {
     BareEventMonitor,
     #[error("Error doing event monitor I/O: {0}")]
     EventMonitorIo(std::io::Error),
-    #[cfg(feature = "gdb")]
+    #[cfg(feature = "guest_debug")]
     #[error("Error parsing --gdb: {0}")]
     ParsingGdb(option_parser::OptionParserError),
-    #[cfg(feature = "gdb")]
+    #[cfg(feature = "guest_debug")]
     #[error("Error parsing --gdb: path required")]
     BareGdb,
     #[error("Error creating log file: {0}")]
@@ -162,7 +155,7 @@ fn create_app<'a>(
             Arg::new("platform")
                 .long("platform")
                 .help(
-                    "num_pci_segments=<num pci segments>,iommu_segments=<list_of_segments>,serial_number=<(DMI) device serial number>",
+                    "num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,serial_number=<dmi_device_serial_number>,uuid=<dmi_device_uuid>,oem_strings=<list_of_strings>",
                 )
                 .takes_value(true)
                 .group("vm-config"),
@@ -200,10 +193,17 @@ fn create_app<'a>(
                 .group("vm-config"),
         )
         .arg(
+            Arg::new("firmware")
+                .long("firmware")
+                .help("Path to firmware that is loaded in an architectural specific way")
+                .takes_value(true)
+                .group("vm-config"),
+        )
+        .arg(
             Arg::new("kernel")
                 .long("kernel")
                 .help(
-                    "Path to loaded kernel. This may be a kernel or firmware that supports a PVH \
+                    "Path to kernel to load. This may be a kernel or firmware that supports a PVH \
                 entry point (e.g. vmlinux) or architecture equivalent",
                 )
                 .takes_value(true)
@@ -377,7 +377,7 @@ fn create_app<'a>(
             Arg::new("seccomp")
                 .long("seccomp")
                 .takes_value(true)
-                .possible_values(&["true", "false", "log"])
+                .possible_values(["true", "false", "log"])
                 .default_value("true"),
         );
 
@@ -391,22 +391,13 @@ fn create_app<'a>(
             .group("vm-config"),
     );
 
-    #[cfg(feature = "gdb")]
+    #[cfg(feature = "guest_debug")]
     let app = app.arg(
         Arg::new("gdb")
             .long("gdb")
             .help("GDB socket (UNIX domain socket): path=</path/to/a/file>")
             .takes_value(true)
             .group("vmm-config"),
-    );
-
-    #[cfg(feature = "tdx")]
-    let app = app.arg(
-        Arg::new("tdx")
-            .long("tdx")
-            .help("TDX Support: firmware=<tdvf path>")
-            .takes_value(true)
-            .group("vm-config"),
     );
 
     app
@@ -521,7 +512,13 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     // Before we start any threads, mask the signals we'll be
     // installing handlers for, to make sure they only ever run on the
     // dedicated signal handling thread we'll start in a bit.
-    for sig in &vmm::vm::HANDLED_SIGNALS {
+    for sig in &vmm::vm::Vm::HANDLED_SIGNALS {
+        if let Err(e) = block_signal(*sig) {
+            eprintln!("Error blocking signals: {}", e);
+        }
+    }
+
+    for sig in &vmm::Vmm::HANDLED_SIGNALS {
         if let Err(e) = block_signal(*sig) {
             eprintln!("Error blocking signals: {}", e);
         }
@@ -531,7 +528,7 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
 
     let hypervisor = hypervisor::new().map_err(Error::CreateHypervisor)?;
 
-    #[cfg(feature = "gdb")]
+    #[cfg(feature = "guest_debug")]
     let gdb_socket_path = if let Some(gdb_config) = cmd_arguments.value_of("gdb") {
         let mut parser = OptionParser::new();
         parser.add("path");
@@ -545,9 +542,9 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     } else {
         None
     };
-    #[cfg(feature = "gdb")]
+    #[cfg(feature = "guest_debug")]
     let debug_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateDebugEventFd)?;
-    #[cfg(feature = "gdb")]
+    #[cfg(feature = "guest_debug")]
     let vm_debug_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateDebugEventFd)?;
 
     let vmm_thread = vmm::start_vmm_thread(
@@ -557,27 +554,21 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
         api_evt.try_clone().unwrap(),
         http_sender,
         api_request_receiver,
-        #[cfg(feature = "gdb")]
+        #[cfg(feature = "guest_debug")]
         gdb_socket_path,
-        #[cfg(feature = "gdb")]
+        #[cfg(feature = "guest_debug")]
         debug_evt.try_clone().unwrap(),
-        #[cfg(feature = "gdb")]
+        #[cfg(feature = "guest_debug")]
         vm_debug_evt.try_clone().unwrap(),
         &seccomp_action,
         hypervisor,
     )
     .map_err(Error::StartVmmThread)?;
 
-    // Can't test for "vm-config" group as some have default values. The kernel (or tdx if enabled)
-    // is the only required option for booting the VM.
-    #[cfg(feature = "tdx")]
-    let tdx_or_kernel_present =
-        cmd_arguments.is_present("kernel") || cmd_arguments.is_present("tdx");
+    let payload_present =
+        cmd_arguments.is_present("kernel") || cmd_arguments.is_present("firmware");
 
-    #[cfg(not(feature = "tdx"))]
-    let tdx_or_kernel_present = cmd_arguments.is_present("kernel");
-
-    if tdx_or_kernel_present {
+    if payload_present {
         let vm_params = config::VmParams::from_arg_matches(&cmd_arguments);
         let vm_config = config::VmConfig::parse(vm_params).map_err(Error::ParsingConfig)?;
 
@@ -640,8 +631,8 @@ mod unit_tests {
     use crate::{create_app, prepare_default_values};
     use std::path::PathBuf;
     use vmm::config::{
-        CmdlineConfig, ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig, KernelConfig,
-        MemoryConfig, RngConfig, VmConfig, VmParams,
+        CmdlineConfig, ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig, MemoryConfig,
+        PayloadConfig, RngConfig, VmConfig, VmParams,
     };
 
     fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
@@ -674,7 +665,7 @@ mod unit_tests {
     #[test]
     fn test_valid_vm_config_default() {
         let cli = vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"];
-        let openapi = r#"{ "kernel": {"path": "/path/to/kernel"} }"#;
+        let openapi = r#"{ "payload": {"kernel": "/path/to/kernel"} }"#;
 
         // First we check we get identical VmConfig structures.
         let (result_vm_config, _) = compare_vm_config_cli_vs_json(&cli, openapi, true);
@@ -702,13 +693,15 @@ mod unit_tests {
                 prefault: false,
                 zones: None,
             },
-            kernel: Some(KernelConfig {
-                path: PathBuf::from("/path/to/kernel"),
-            }),
-            initramfs: None,
+            kernel: None,
             cmdline: CmdlineConfig {
-                args: String::from(""),
+                args: String::default(),
             },
+            initramfs: None,
+            payload: Some(PayloadConfig {
+                kernel: Some(PathBuf::from("/path/to/kernel")),
+                ..Default::default()
+            }),
             disks: None,
             net: None,
             rng: RngConfig {
@@ -737,9 +730,7 @@ mod unit_tests {
             sgx_epc: None,
             numa: None,
             watchdog: false,
-            #[cfg(feature = "tdx")]
-            tdx: None,
-            #[cfg(feature = "gdb")]
+            #[cfg(feature = "guest_debug")]
             gdb: false,
             platform: None,
         };
@@ -759,7 +750,7 @@ mod unit_tests {
                     "boot=1",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "cpus": {"boot_vcpus": 1, "max_vcpus": 1}
                 }"#,
                 true,
@@ -773,7 +764,7 @@ mod unit_tests {
                     "boot=1,max=3",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "cpus": {"boot_vcpus": 1, "max_vcpus": 3}
                 }"#,
                 true,
@@ -787,7 +778,7 @@ mod unit_tests {
                     "boot=2,max=4",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "cpus": {"boot_vcpus": 1, "max_vcpus": 3}
                 }"#,
                 false,
@@ -805,7 +796,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1073741824"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory": {"size": 1073741824}
                 }"#,
                 true,
@@ -813,7 +804,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory": {"size": 1073741824}
                 }"#,
                 true,
@@ -821,7 +812,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,mergeable=on"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory": {"size": 1073741824, "mergeable": true}
                 }"#,
                 true,
@@ -829,7 +820,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,mergeable=off"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory": {"size": 1073741824, "mergeable": false}
                 }"#,
                 true,
@@ -837,7 +828,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,mergeable=on"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory": {"size": 1073741824, "mergeable": false}
                 }"#,
                 false,
@@ -845,7 +836,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,hotplug_size=1G"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory": {"size": 1073741824, "hotplug_method": "Acpi", "hotplug_size": 1073741824}
                 }"#,
                 true,
@@ -853,7 +844,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "size=1G,hotplug_method=virtio-mem,hotplug_size=1G"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory": {"size": 1073741824, "hotplug_method": "VirtioMem", "hotplug_size": 1073741824}
                 }"#,
                 true,
@@ -870,7 +861,7 @@ mod unit_tests {
         vec![(
             vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
             r#"{
-                "kernel": {"path": "/path/to/kernel"}
+                "payload": {"kernel": "/path/to/kernel"}
             }"#,
             true,
         )]
@@ -891,8 +882,7 @@ mod unit_tests {
                 "arg1=foo arg2=bar",
             ],
             r#"{
-                "kernel": {"path": "/path/to/kernel"},
-                "cmdline": {"args": "arg1=foo arg2=bar"}
+                "payload": {"kernel": "/path/to/kernel", "cmdline": "arg1=foo arg2=bar"}
             }"#,
             true,
         )]
@@ -915,7 +905,7 @@ mod unit_tests {
                     "path=/path/to/disk/2",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "disks": [
                         {"path": "/path/to/disk/1"},
                         {"path": "/path/to/disk/2"}
@@ -933,7 +923,7 @@ mod unit_tests {
                     "path=/path/to/disk/2",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "disks": [
                         {"path": "/path/to/disk/1"}
                     ]
@@ -951,7 +941,7 @@ mod unit_tests {
                     "vhost_user=true,socket=/tmp/sock1",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory" : { "shared": true, "size": 536870912 },
                     "disks": [
                         {"vhost_user":true, "vhost_socket":"/tmp/sock1"}
@@ -970,7 +960,7 @@ mod unit_tests {
                     "vhost_user=true,socket=/tmp/sock1",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory" : { "shared": true, "size": 536870912 },
                     "disks": [
                         {"vhost_user":true, "vhost_socket":"/tmp/sock1"}
@@ -994,7 +984,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--net", "mac="],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": []
                 }"#,
                 false,
@@ -1002,7 +992,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--net", "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd"}
                     ]
@@ -1016,7 +1006,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0"}
                     ]
@@ -1030,7 +1020,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4"}
                     ]
@@ -1044,7 +1034,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8"}
                     ]
@@ -1059,7 +1049,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=4",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 4}
@@ -1075,7 +1065,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=4,queue_size=128",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "cpus": {"boot_vcpus": 2, "max_vcpus": 2},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 4, "queue_size": 128}
@@ -1090,7 +1080,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8"}
                     ]
@@ -1104,7 +1094,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256}
                     ]
@@ -1119,7 +1109,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256,iommu=on",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256, "iommu": true}
                     ]
@@ -1134,7 +1124,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256,iommu=on",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256, "iommu": true}
                     ],
@@ -1149,7 +1139,7 @@ mod unit_tests {
                     "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,tap=tap0,ip=1.2.3.4,mask=5.6.7.8,num_queues=2,queue_size=256,iommu=off",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "tap": "tap0", "ip": "1.2.3.4", "mask": "5.6.7.8", "num_queues": 2, "queue_size": 256, "iommu": false}
                     ]
@@ -1159,7 +1149,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel", "--memory", "shared=true", "--net", "mac=12:34:56:78:90:ab,host_mac=34:56:78:90:ab:cd,vhost_user=true,socket=/tmp/sock"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory" : { "shared": true, "size": 536870912 },
                     "net": [
                         {"mac": "12:34:56:78:90:ab", "host_mac": "34:56:78:90:ab:cd", "vhost_user": true, "vhost_socket": "/tmp/sock"}
@@ -1185,7 +1175,7 @@ mod unit_tests {
                 "src=/path/to/entropy/source",
             ],
             r#"{
-                "kernel": {"path": "/path/to/kernel"},
+                "payload": {"kernel": "/path/to/kernel"},
                 "rng": {"src": "/path/to/entropy/source"}
             }"#,
             true,
@@ -1208,7 +1198,7 @@ mod unit_tests {
                     "tag=virtiofs2,socket=/path/to/sock2",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory" : { "shared": true, "size": 536870912 },
                     "fs": [
                         {"tag": "virtiofs1", "socket": "/path/to/sock1"},
@@ -1226,7 +1216,7 @@ mod unit_tests {
                     "tag=virtiofs2,socket=/path/to/sock2",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory" : { "shared": true, "size": 536870912 },
                     "fs": [
                         {"tag": "virtiofs1", "socket": "/path/to/sock1"}
@@ -1242,7 +1232,7 @@ mod unit_tests {
                     "tag=virtiofs1,socket=/path/to/sock1,num_queues=4",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory" : { "shared": true, "size": 536870912 },
                     "cpus": {"boot_vcpus": 4, "max_vcpus": 4},
                     "fs": [
@@ -1259,7 +1249,7 @@ mod unit_tests {
                     "tag=virtiofs1,socket=/path/to/sock1,num_queues=4,queue_size=128"
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "memory" : { "shared": true, "size": 536870912 },
                     "cpus": {"boot_vcpus": 4, "max_vcpus": 4},
                     "fs": [
@@ -1288,7 +1278,7 @@ mod unit_tests {
                     "file=/path/to/img/2,size=2G",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "pmem": [
                         {"file": "/path/to/img/1", "size": 1073741824},
                         {"file": "/path/to/img/2", "size": 2147483648}
@@ -1306,7 +1296,7 @@ mod unit_tests {
                     "file=/path/to/img/1,size=1G,iommu=on",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "pmem": [
                         {"file": "/path/to/img/1", "size": 1073741824, "iommu": true}
                     ],
@@ -1324,7 +1314,7 @@ mod unit_tests {
                     "file=/path/to/img/1,size=1G,iommu=on",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "pmem": [
                         {"file": "/path/to/img/1", "size": 1073741824, "iommu": true}
                     ]
@@ -1344,7 +1334,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "serial": {"mode": "Null"},
                     "console": {"mode": "Tty"}
                 }"#,
@@ -1361,7 +1351,7 @@ mod unit_tests {
                     "tty",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"}
+                    "payload": {"kernel": "/path/to/kernel"}
                 }"#,
                 true,
             ),
@@ -1376,7 +1366,7 @@ mod unit_tests {
                     "off",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "serial": {"mode": "Tty"},
                     "console": {"mode": "Off"}
                 }"#,
@@ -1395,7 +1385,7 @@ mod unit_tests {
             (
                 vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "serial": {"mode": "Null"},
                     "console": {"mode": "Tty"}
                 }"#,
@@ -1412,7 +1402,7 @@ mod unit_tests {
                     "tty",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"}
+                    "payload": {"kernel": "/path/to/kernel"}
                 }"#,
                 true,
             ),
@@ -1427,7 +1417,7 @@ mod unit_tests {
                     "pty",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "serial": {"mode": "Pty"},
                     "console": {"mode": "Pty"}
                 }"#,
@@ -1454,7 +1444,7 @@ mod unit_tests {
                     "path=/path/to/device/2",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "devices": [
                         {"path": "/path/to/device/1"},
                         {"path": "/path/to/device/2"}
@@ -1472,7 +1462,7 @@ mod unit_tests {
                     "path=/path/to/device/2",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "devices": [
                         {"path": "/path/to/device/1"}
                     ]
@@ -1488,7 +1478,7 @@ mod unit_tests {
                     "path=/path/to/device,iommu=on",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "devices": [
                         {"path": "/path/to/device", "iommu": true}
                     ],
@@ -1505,7 +1495,7 @@ mod unit_tests {
                     "path=/path/to/device,iommu=on",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "devices": [
                         {"path": "/path/to/device", "iommu": true}
                     ]
@@ -1521,7 +1511,7 @@ mod unit_tests {
                     "path=/path/to/device,iommu=off",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "devices": [
                         {"path": "/path/to/device", "iommu": false}
                     ]
@@ -1548,7 +1538,7 @@ mod unit_tests {
                     "path=/path/to/device/2,num_queues=2",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "vdpa": [
                         {"path": "/path/to/device/1", "num_queues": 1},
                         {"path": "/path/to/device/2", "num_queues": 2}
@@ -1566,7 +1556,7 @@ mod unit_tests {
                     "path=/path/to/device/2",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "vdpa": [
                         {"path": "/path/to/device/1"}
                     ]
@@ -1592,7 +1582,7 @@ mod unit_tests {
                     "cid=123,socket=/path/to/sock/1",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "vsock": {"cid": 123, "socket": "/path/to/sock/1"}
                 }"#,
                 true,
@@ -1606,7 +1596,7 @@ mod unit_tests {
                     "cid=124,socket=/path/to/sock/1",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "vsock": {"cid": 123, "socket": "/path/to/sock/1"}
                 }"#,
                 false,
@@ -1621,7 +1611,7 @@ mod unit_tests {
                     "cid=123,socket=/path/to/sock/1,iommu=on",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "vsock": {"cid": 123, "socket": "/path/to/sock/1", "iommu": true},
                     "iommu": true
                 }"#,
@@ -1637,7 +1627,7 @@ mod unit_tests {
                     "cid=123,socket=/path/to/sock/1,iommu=on",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "vsock": {"cid": 123, "socket": "/path/to/sock/1", "iommu": true}
                 }"#,
                 false,
@@ -1651,7 +1641,7 @@ mod unit_tests {
                     "cid=123,socket=/path/to/sock/1,iommu=off",
                 ],
                 r#"{
-                    "kernel": {"path": "/path/to/kernel"},
+                    "payload": {"kernel": "/path/to/kernel"},
                     "vsock": {"cid": 123, "socket": "/path/to/sock/1", "iommu": false}
                 }"#,
                 true,

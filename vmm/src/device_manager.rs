@@ -21,11 +21,10 @@ use crate::pci_segment::PciSegment;
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 use crate::sigwinch_listener::start_sigwinch_listener;
-#[cfg(target_arch = "aarch64")]
-use crate::GuestMemoryMmap;
 use crate::GuestRegionMmap;
 use crate::PciDeviceInfo;
 use crate::{device_node, DEVICE_MANAGER_SNAPSHOT_ID};
+use acpi_tables::sdt::GenericAddress;
 use acpi_tables::{aml, aml::Aml};
 use anyhow::anyhow;
 use arch::layout;
@@ -50,7 +49,7 @@ use devices::legacy::Serial;
 use devices::{
     interrupt_controller, interrupt_controller::InterruptController, AcpiNotificationFlags,
 };
-use hypervisor::{DeviceFd, HypervisorVmError, IoEventAddress};
+use hypervisor::{HypervisorType, IoEventAddress};
 use libc::{
     cfmakeraw, isatty, tcgetattr, tcsetattr, termios, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED,
     O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW,
@@ -75,7 +74,8 @@ use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use vfio_ioctls::{VfioContainer, VfioDevice};
+use tracer::trace_scoped;
+use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd};
 use virtio_devices::transport::VirtioTransport;
 use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator};
 use virtio_devices::vhost_user::VhostUserConfig;
@@ -91,8 +91,6 @@ use vm_device::interrupt::{
 };
 use vm_device::{Bus, BusDevice, Resource};
 use vm_memory::guest_memory::FileOffset;
-#[cfg(target_arch = "aarch64")]
-use vm_memory::GuestMemoryAtomic;
 use vm_memory::GuestMemoryRegion;
 use vm_memory::{Address, GuestAddress, GuestUsize, MmapRegion};
 #[cfg(target_arch = "x86_64")]
@@ -366,9 +364,6 @@ pub enum DeviceManagerError {
     /// Cannot create virtio-mem device
     CreateVirtioMem(io::Error),
 
-    /// Cannot generate a ResizeSender from the Resize object.
-    CreateResizeSender(virtio_devices::mem::Error),
-
     /// Cannot find a memory range for virtio-mem memory
     VirtioMemRangeAllocation,
 
@@ -463,9 +458,6 @@ pub enum DeviceManagerError {
     /// Cannot hotplug device behind vIOMMU
     InvalidIommuHotplug,
 
-    /// Failed to create UEFI flash
-    CreateUefiFlash(HypervisorVmError),
-
     /// Invalid identifier as it is not unique.
     IdentifierNotUnique(String),
 
@@ -482,7 +474,7 @@ const DEVICE_MANAGER_ACPI_SIZE: usize = 0x10;
 const TIOCSPTLCK: libc::c_int = 0x4004_5431;
 const TIOCGTPEER: libc::c_int = 0x5441;
 
-pub fn create_pty(non_blocking: bool) -> io::Result<(File, File, PathBuf)> {
+pub fn create_pty() -> io::Result<(File, File, PathBuf)> {
     // Try to use /dev/pts/ptmx first then fall back to /dev/ptmx
     // This is done to try and use the devpts filesystem that
     // could be available for use in the process's namespace first.
@@ -491,7 +483,7 @@ pub fn create_pty(non_blocking: bool) -> io::Result<(File, File, PathBuf)> {
     // See https://www.kernel.org/doc/Documentation/filesystems/devpts.txt
     // for further details.
 
-    let custom_flags = libc::O_NOCTTY | if non_blocking { libc::O_NONBLOCK } else { 0 };
+    let custom_flags = libc::O_NONBLOCK;
     let main = match OpenOptions::new()
         .read(true)
         .write(true)
@@ -776,7 +768,6 @@ struct DeviceManagerState {
 #[derive(Debug)]
 pub struct PtyPair {
     pub main: File,
-    pub sub: File,
     pub path: PathBuf,
 }
 
@@ -784,7 +775,6 @@ impl Clone for PtyPair {
     fn clone(&self) -> Self {
         PtyPair {
             main: self.main.try_clone().unwrap(),
-            sub: self.sub.try_clone().unwrap(),
             path: self.path.clone(),
         }
     }
@@ -806,7 +796,18 @@ struct MetaVirtioDevice {
     dma_handler: Option<Arc<dyn ExternalDmaMapping>>,
 }
 
+#[derive(Default)]
+pub struct AcpiPlatformAddresses {
+    pub pm_timer_address: Option<GenericAddress>,
+    pub reset_reg_address: Option<GenericAddress>,
+    pub sleep_control_reg_address: Option<GenericAddress>,
+    pub sleep_status_reg_address: Option<GenericAddress>,
+}
+
 pub struct DeviceManager {
+    // The underlying hypervisor
+    hypervisor_type: HypervisorType,
+
     // Manage address space related to devices
     address_manager: Arc<AddressManager>,
 
@@ -867,7 +868,7 @@ pub struct DeviceManager {
     legacy_interrupt_manager: Option<Arc<dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>>>,
 
     // Passthrough device handle
-    passthrough_device: Option<Arc<dyn hypervisor::Device>>,
+    passthrough_device: Option<VfioDeviceFd>,
 
     // VFIO container
     // Only one container can be created, therefore it is stored as part of the
@@ -919,10 +920,6 @@ pub struct DeviceManager {
     // GPIO device for AArch64
     gpio_device: Option<Arc<Mutex<devices::legacy::Gpio>>>,
 
-    #[cfg(target_arch = "aarch64")]
-    // Flash device for UEFI on AArch64
-    uefi_flash: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
-
     // Flag to force setting the iommu on virtio devices
     force_iommu: bool,
 
@@ -940,11 +937,15 @@ pub struct DeviceManager {
 
     // Pending activations
     pending_activations: Arc<Mutex<Vec<VirtioPciDeviceActivator>>>,
+
+    // Addresses for ACPI platform devices e.g. ACPI PM timer, sleep/reset registers
+    acpi_platform_addresses: AcpiPlatformAddresses,
 }
 
 impl DeviceManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        hypervisor_type: HypervisorType,
         vm: Arc<dyn hypervisor::Vm>,
         config: Arc<Mutex<VmConfig>>,
         memory_manager: Arc<Mutex<MemoryManager>>,
@@ -958,6 +959,8 @@ impl DeviceManager {
         boot_id_list: BTreeSet<String>,
         timestamp: Instant,
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
+        trace_scoped!("DeviceManager::new");
+
         let device_tree = Arc::new(Mutex::new(DeviceTree::new()));
 
         let num_pci_segments =
@@ -1035,6 +1038,7 @@ impl DeviceManager {
         }
 
         let device_manager = DeviceManager {
+            hypervisor_type,
             address_manager: Arc::clone(&address_manager),
             console: Arc::new(Console::default()),
             interrupt_controller: None,
@@ -1074,14 +1078,13 @@ impl DeviceManager {
             virtio_mem_devices: Vec::new(),
             #[cfg(target_arch = "aarch64")]
             gpio_device: None,
-            #[cfg(target_arch = "aarch64")]
-            uefi_flash: None,
             force_iommu,
             restoring,
             io_uring_supported: None,
             boot_id_list,
             timestamp,
             pending_activations: Arc::new(Mutex::new(Vec::default())),
+            acpi_platform_addresses: AcpiPlatformAddresses::default(),
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -1120,6 +1123,8 @@ impl DeviceManager {
         console_pty: Option<PtyPair>,
         console_resize_pipe: Option<File>,
     ) -> DeviceManagerResult<()> {
+        trace_scoped!("create_devices");
+
         let mut virtio_devices: Vec<MetaVirtioDevice> = Vec::new();
 
         let interrupt_controller = self.add_interrupt_controller()?;
@@ -1202,11 +1207,11 @@ impl DeviceManager {
         #[cfg(target_arch = "aarch64")]
         {
             let vcpus = self.config.lock().unwrap().cpus.boot_vcpus;
-            let msi_start = arch::layout::GIC_V3_DIST_START.raw_value()
-                - arch::layout::GIC_V3_REDIST_SIZE * (vcpus as u64)
-                - arch::layout::GIC_V3_ITS_SIZE;
-            let msi_end = msi_start + arch::layout::GIC_V3_ITS_SIZE - 1;
-            (msi_start, msi_end)
+            let vgic_config = gic::Gic::create_default_config(vcpus.into());
+            (
+                vgic_config.msi_addr,
+                vgic_config.msi_addr + vgic_config.msi_size - 1,
+            )
         }
         #[cfg(target_arch = "x86_64")]
         (0xfee0_0000, 0xfeef_ffff)
@@ -1393,6 +1398,10 @@ impl DeviceManager {
 
         #[cfg(target_arch = "x86_64")]
         {
+            let shutdown_pio_address: u16 = 0x600;
+
+            // TODO: Remove the entry for 0x3c0 once all firmwares will have been
+            // updated with the new value.
             self.address_manager
                 .allocator
                 .lock()
@@ -1401,9 +1410,30 @@ impl DeviceManager {
                 .ok_or(DeviceManagerError::AllocateIoPort)?;
 
             self.address_manager
+                .allocator
+                .lock()
+                .unwrap()
+                .allocate_io_addresses(Some(GuestAddress(shutdown_pio_address.into())), 0x8, None)
+                .ok_or(DeviceManagerError::AllocateIoPort)?;
+
+            // TODO: Remove the entry for 0x3c0 once all firmwares will have been
+            // updated with the new value.
+            self.address_manager
                 .io_bus
-                .insert(shutdown_device, 0x3c0, 0x4)
+                .insert(shutdown_device.clone(), 0x3c0, 0x4)
                 .map_err(DeviceManagerError::BusError)?;
+
+            self.address_manager
+                .io_bus
+                .insert(shutdown_device, shutdown_pio_address.into(), 0x4)
+                .map_err(DeviceManagerError::BusError)?;
+
+            self.acpi_platform_addresses.sleep_control_reg_address =
+                Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+            self.acpi_platform_addresses.sleep_status_reg_address =
+                Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
+            self.acpi_platform_addresses.reset_reg_address =
+                Some(GenericAddress::io_port_address::<u8>(shutdown_pio_address));
         }
 
         let ged_irq = self
@@ -1452,6 +1482,10 @@ impl DeviceManager {
 
         #[cfg(target_arch = "x86_64")]
         {
+            let pm_timer_pio_address: u16 = 0x608;
+
+            // TODO: Remove the entry for 0xb008 once all firmwares will have been
+            // updated with the new value.
             self.address_manager
                 .allocator
                 .lock()
@@ -1460,9 +1494,26 @@ impl DeviceManager {
                 .ok_or(DeviceManagerError::AllocateIoPort)?;
 
             self.address_manager
+                .allocator
+                .lock()
+                .unwrap()
+                .allocate_io_addresses(Some(GuestAddress(pm_timer_pio_address.into())), 0x4, None)
+                .ok_or(DeviceManagerError::AllocateIoPort)?;
+
+            // TODO: Remove the entry for 0xb008 once all firmwares will have been
+            // updated with the new value.
+            self.address_manager
                 .io_bus
-                .insert(pm_timer_device, 0xb008, 0x4)
+                .insert(pm_timer_device.clone(), 0xb008, 0x4)
                 .map_err(DeviceManagerError::BusError)?;
+
+            self.address_manager
+                .io_bus
+                .insert(pm_timer_device, pm_timer_pio_address.into(), 0x4)
+                .map_err(DeviceManagerError::BusError)?;
+
+            self.acpi_platform_addresses.pm_timer_address =
+                Some(GenericAddress::io_port_address::<u32>(pm_timer_pio_address));
         }
 
         Ok(Some(ged_device))
@@ -1509,9 +1560,7 @@ impl DeviceManager {
                 .io_bus
                 .insert(cmos, 0x70, 0x2)
                 .map_err(DeviceManagerError::BusError)?;
-        }
-        #[cfg(feature = "fwdebug")]
-        {
+
             let fwdebug = Arc::new(Mutex::new(devices::legacy::FwDebugDevice::new()));
 
             self.bus_devices
@@ -1622,38 +1671,6 @@ impl DeviceManager {
             .lock()
             .unwrap()
             .insert(id.clone(), device_node!(id, gpio_device));
-
-        // On AArch64, the UEFI binary requires a flash device at address 0.
-        // 4 MiB memory is mapped to simulate the flash.
-        let uefi_mem_slot = self.memory_manager.lock().unwrap().allocate_memory_slot();
-        let uefi_region = GuestRegionMmap::new(
-            MmapRegion::new(arch::layout::UEFI_SIZE as usize).unwrap(),
-            arch::layout::UEFI_START,
-        )
-        .unwrap();
-        let uefi_mem_region = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .vm
-            .make_user_memory_region(
-                uefi_mem_slot,
-                uefi_region.start_addr().raw_value(),
-                uefi_region.len() as u64,
-                uefi_region.as_ptr() as u64,
-                false,
-                false,
-            );
-        self.memory_manager
-            .lock()
-            .unwrap()
-            .vm
-            .create_user_memory_region(uefi_mem_region)
-            .map_err(DeviceManagerError::CreateUefiFlash)?;
-
-        let uefi_flash =
-            GuestMemoryAtomic::new(GuestMemoryMmap::from_regions(vec![uefi_region]).unwrap());
-        self.uefi_flash = Some(uefi_flash);
 
         Ok(())
     }
@@ -1802,11 +1819,15 @@ impl DeviceManager {
         self.modify_mode(f.as_raw_fd(), |t| unsafe { cfmakeraw(t) })
     }
 
-    fn listen_for_sigwinch_on_tty(&mut self, pty: &File) -> std::io::Result<()> {
-        let seccomp_filter =
-            get_seccomp_filter(&self.seccomp_action, Thread::PtyForeground).unwrap();
+    fn listen_for_sigwinch_on_tty(&mut self, pty_main: File, pty_sub: File) -> std::io::Result<()> {
+        let seccomp_filter = get_seccomp_filter(
+            &self.seccomp_action,
+            Thread::PtyForeground,
+            self.hypervisor_type,
+        )
+        .unwrap();
 
-        match start_sigwinch_listener(seccomp_filter, pty) {
+        match start_sigwinch_listener(seccomp_filter, pty_main, pty_sub) {
             Ok(pipe) => {
                 self.console_resize_pipe = Some(Arc::new(pipe));
             }
@@ -1837,18 +1858,19 @@ impl DeviceManager {
                     let file = pty.main.try_clone().unwrap();
                     self.console_pty = Some(Arc::new(Mutex::new(pty)));
                     self.console_resize_pipe = resize_pipe.map(Arc::new);
-                    Endpoint::FilePair(file.try_clone().unwrap(), file)
+                    Endpoint::PtyPair(file.try_clone().unwrap(), file)
                 } else {
                     let (main, mut sub, path) =
-                        create_pty(false).map_err(DeviceManagerError::ConsolePtyOpen)?;
+                        create_pty().map_err(DeviceManagerError::ConsolePtyOpen)?;
                     self.set_raw_mode(&mut sub)
                         .map_err(DeviceManagerError::SetPtyRaw)?;
                     self.config.lock().unwrap().console.file = Some(path.clone());
                     let file = main.try_clone().unwrap();
                     assert!(resize_pipe.is_none());
-                    self.listen_for_sigwinch_on_tty(&sub).unwrap();
-                    self.console_pty = Some(Arc::new(Mutex::new(PtyPair { main, sub, path })));
-                    Endpoint::FilePair(file.try_clone().unwrap(), file)
+                    self.listen_for_sigwinch_on_tty(main.try_clone().unwrap(), sub)
+                        .unwrap();
+                    self.console_pty = Some(Arc::new(Mutex::new(PtyPair { main, path })));
+                    Endpoint::PtyPair(file.try_clone().unwrap(), file)
                 }
             }
             ConsoleOutputMode::Tty => {
@@ -1944,11 +1966,11 @@ impl DeviceManager {
                     self.serial_pty = Some(Arc::new(Mutex::new(pty)));
                 } else {
                     let (main, mut sub, path) =
-                        create_pty(true).map_err(DeviceManagerError::SerialPtyOpen)?;
+                        create_pty().map_err(DeviceManagerError::SerialPtyOpen)?;
                     self.set_raw_mode(&mut sub)
                         .map_err(DeviceManagerError::SetPtyRaw)?;
                     self.config.lock().unwrap().serial.file = Some(path.clone());
-                    self.serial_pty = Some(Arc::new(Mutex::new(PtyPair { main, sub, path })));
+                    self.serial_pty = Some(Arc::new(Mutex::new(PtyPair { main, path })));
                 }
                 None
             }
@@ -2222,6 +2244,7 @@ impl DeviceManager {
                 match virtio_devices::vhost_user::Net::new(
                     id.clone(),
                     net_cfg.mac,
+                    net_cfg.mtu,
                     vu_cfg,
                     server,
                     self.seccomp_action.clone(),
@@ -2252,6 +2275,7 @@ impl DeviceManager {
                         None,
                         Some(net_cfg.mac),
                         &mut net_cfg.host_mac,
+                        net_cfg.mtu,
                         self.force_iommu | net_cfg.iommu,
                         net_cfg.num_queues,
                         net_cfg.queue_size,
@@ -2269,6 +2293,7 @@ impl DeviceManager {
                         id.clone(),
                         fds,
                         Some(net_cfg.mac),
+                        net_cfg.mtu,
                         self.force_iommu | net_cfg.iommu,
                         net_cfg.queue_size,
                         self.seccomp_action.clone(),
@@ -2288,6 +2313,7 @@ impl DeviceManager {
                         Some(net_cfg.mask),
                         Some(net_cfg.mac),
                         &mut net_cfg.host_mac,
+                        net_cfg.mtu,
                         self.force_iommu | net_cfg.iommu,
                         net_cfg.num_queues,
                         net_cfg.queue_size,
@@ -2701,9 +2727,9 @@ impl DeviceManager {
         let mut devices = Vec::new();
 
         let mm = self.memory_manager.clone();
-        let mm = mm.lock().unwrap();
-        for (memory_zone_id, memory_zone) in mm.memory_zones().iter() {
-            if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone() {
+        let mut mm = mm.lock().unwrap();
+        for (memory_zone_id, memory_zone) in mm.memory_zones_mut().iter_mut() {
+            if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone_mut() {
                 info!("Creating virtio-mem device: id = {}", memory_zone_id);
 
                 let node_id = numa_node_id_from_memory_zone_id(&self.numa_nodes, memory_zone_id)
@@ -2713,10 +2739,6 @@ impl DeviceManager {
                     virtio_devices::Mem::new(
                         memory_zone_id.clone(),
                         virtio_mem_zone.region(),
-                        virtio_mem_zone
-                            .resize_handler()
-                            .new_resize_sender()
-                            .map_err(DeviceManagerError::CreateResizeSender)?,
                         self.seccomp_action.clone(),
                         node_id,
                         virtio_mem_zone.hotplugged_size(),
@@ -2728,6 +2750,11 @@ impl DeviceManager {
                     )
                     .map_err(DeviceManagerError::CreateVirtioMem)?,
                 ));
+
+                // Update the virtio-mem zone so that it has a handle onto the
+                // virtio-mem device, which will be used for triggering a resize
+                // if needed.
+                virtio_mem_zone.set_virtio_device(Arc::clone(&virtio_mem_device));
 
                 self.virtio_mem_devices.push(Arc::clone(&virtio_mem_device));
 
@@ -2942,30 +2969,12 @@ impl DeviceManager {
             .as_ref()
             .ok_or(DeviceManagerError::NoDevicePassthroughSupport)?;
 
-        // Safe because we know the RawFd is valid.
-        //
-        // This dup() is mandatory to be able to give full ownership of the
-        // file descriptor to the DeviceFd::from_raw_fd() function later in
-        // the code.
-        //
-        // This is particularly needed so that VfioContainer will still have
-        // a valid file descriptor even if DeviceManager, and therefore the
-        // passthrough_device are dropped. In case of Drop, the file descriptor
-        // would be closed, but Linux would still have the duplicated file
-        // descriptor opened from DeviceFd, preventing from unexpected behavior
-        // where the VfioContainer would try to use a closed file descriptor.
-        let dup_device_fd = unsafe { libc::dup(passthrough_device.as_raw_fd()) };
-        if dup_device_fd == -1 {
-            return vmm_sys_util::errno::errno_result().map_err(DeviceManagerError::DupFd);
-        }
+        let dup = passthrough_device
+            .try_clone()
+            .map_err(DeviceManagerError::VfioCreate)?;
 
-        // SAFETY the raw fd conversion here is safe because:
-        //   1. When running on KVM or MSHV, passthrough_device wraps around DeviceFd.
-        //   2. The conversion here extracts the raw fd and then turns the raw fd into a DeviceFd
-        //      of the same (correct) type.
         Ok(Arc::new(
-            VfioContainer::new(Arc::new(unsafe { DeviceFd::from_raw_fd(dup_device_fd) }))
-                .map_err(DeviceManagerError::VfioCreate)?,
+            VfioContainer::new(Some(Arc::new(dup))).map_err(DeviceManagerError::VfioCreate)?,
         ))
     }
 
@@ -4113,11 +4122,6 @@ impl DeviceManager {
         &self.iommu_attached_devices
     }
 
-    #[cfg(target_arch = "aarch64")]
-    pub fn uefi_flash(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
-        self.uefi_flash.as_ref().unwrap().clone()
-    }
-
     fn validate_identifier(&self, id: &Option<String>) -> DeviceManagerResult<()> {
         if let Some(id) = id {
             if id.starts_with("__") {
@@ -4130,6 +4134,10 @@ impl DeviceManager {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn acpi_platform_addresses(&self) -> &AcpiPlatformAddresses {
+        &self.acpi_platform_addresses
     }
 }
 

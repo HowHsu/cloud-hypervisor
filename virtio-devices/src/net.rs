@@ -15,6 +15,7 @@ use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::GuestMemoryMmap;
 use crate::VirtioInterrupt;
+use anyhow::anyhow;
 use net_util::CtrlQueue;
 use net_util::{
     build_net_config_space, build_net_config_space_with_mq, open_tap,
@@ -24,6 +25,7 @@ use net_util::{
 use seccompiler::SeccompAction;
 use std::net::Ipv4Addr;
 use std::num::Wrapping;
+use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::result;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,12 +33,13 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::vec::Vec;
 use std::{collections::HashMap, convert::TryInto};
+use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_bindings::bindings::virtio_net::*;
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use virtio_queue::Queue;
-use vm_memory::{ByteValued, GuestMemoryAtomic};
+use virtio_queue::{Queue, QueueT};
+use vm_memory::{ByteValued, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
@@ -46,12 +49,16 @@ use vmm_sys_util::eventfd::EventFd;
 // Event available on the control queue.
 const CTRL_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 
+// Following the VIRTIO specification, the MTU should be at least 1280.
+pub const MIN_MTU: u16 = 1280;
+
 pub struct NetCtrlEpollHandler {
+    pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
     pub kill_evt: EventFd,
     pub pause_evt: EventFd,
     pub ctrl_q: CtrlQueue,
     pub queue_evt: EventFd,
-    pub queue: Queue<GuestMemoryAtomic<GuestMemoryMmap>>,
+    pub queue: Queue,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
     pub interrupt_cb: Arc<dyn VirtioInterrupt>,
     pub queue_index: u16,
@@ -81,43 +88,55 @@ impl NetCtrlEpollHandler {
 }
 
 impl EpollHelperHandler for NetCtrlEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
             CTRL_QUEUE_EVENT => {
-                if let Err(e) = self.queue_evt.read() {
-                    error!("Failed to get control queue event: {:?}", e);
-                    return true;
-                }
-                if let Err(e) = self
-                    .ctrl_q
-                    .process(&mut self.queue, self.access_platform.as_ref())
-                {
-                    error!("Failed to process control queue: {:?}", e);
-                    return true;
-                } else {
-                    match self.queue.needs_notification() {
-                        Ok(true) => {
-                            if let Err(e) = self.signal_used_queue(self.queue_index) {
-                                error!("Error signalling that control queue was used: {:?}", e);
-                                return true;
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            error!("Error getting notification state of control queue: {}", e);
-                            return true;
-                        }
+                let mem = self.mem.memory();
+                self.queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!(
+                        "Failed to get control queue event: {:?}",
+                        e
+                    ))
+                })?;
+                self.ctrl_q
+                    .process(mem.deref(), &mut self.queue, self.access_platform.as_ref())
+                    .map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process control queue: {:?}",
+                            e
+                        ))
+                    })?;
+                match self.queue.needs_notification(mem.deref()) {
+                    Ok(true) => {
+                        self.signal_used_queue(self.queue_index).map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!(
+                                "Error signalling that control queue was used: {:?}",
+                                e
+                            ))
+                        })?;
                     }
-                }
+                    Ok(false) => {}
+                    Err(e) => {
+                        return Err(EpollHelperError::HandleEvent(anyhow!(
+                            "Error getting notification state of control queue: {}",
+                            e
+                        )));
+                    }
+                };
             }
             _ => {
-                error!("Unknown event for virtio-net control queue");
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unknown event for virtio-net control queue"
+                )));
             }
         }
 
-        false
+        Ok(())
     }
 }
 
@@ -135,15 +154,13 @@ pub const RX_RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 5;
 // New 'wake up' event from the tx rate limiter
 pub const TX_RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 6;
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    /// Failed to open taps.
+    #[error("Failed to open taps: {0}")]
     OpenTap(OpenTapError),
-
-    // Using existing tap
+    #[error("Using existing tap: {0}")]
     TapError(TapError),
-
-    // Error calling dup() on tap fd
+    #[error("Error calling dup() on tap fd: {0}")]
     DuplicateTapFd(std::io::Error),
 }
 
@@ -151,11 +168,12 @@ pub type Result<T> = result::Result<T, Error>;
 
 struct NetEpollHandler {
     net: NetQueuePair,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     kill_evt: EventFd,
     pause_evt: EventFd,
     queue_index_base: u16,
-    queue_pair: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
+    queue_pair: Vec<Queue>,
     queue_evt_pair: Vec<EventFd>,
     // Always generate interrupts until the driver has signalled to the device.
     // This mitigates a problem with interrupts from tap events being "lost" upon
@@ -206,7 +224,7 @@ impl NetEpollHandler {
     fn process_tx(&mut self) -> result::Result<(), DeviceError> {
         if self
             .net
-            .process_tx(&mut self.queue_pair[1])
+            .process_tx(&self.mem.memory(), &mut self.queue_pair[1])
             .map_err(DeviceError::NetQueuePair)?
             || !self.driver_awake
         {
@@ -235,7 +253,7 @@ impl NetEpollHandler {
     fn handle_rx_tap_event(&mut self) -> result::Result<(), DeviceError> {
         if self
             .net
-            .process_rx(&mut self.queue_pair[0])
+            .process_rx(&self.mem.memory(), &mut self.queue_pair[0])
             .map_err(DeviceError::NetQueuePair)?
             || !self.driver_awake
         {
@@ -262,13 +280,14 @@ impl NetEpollHandler {
             helper.add_event(rate_limiter.as_raw_fd(), TX_RATE_LIMITER_EVENT)?;
         }
 
+        let mem = self.mem.memory();
         // If there are some already available descriptors on the RX queue,
         // then we can start the thread while listening onto the TAP.
         if self.queue_pair[0]
-            .used_idx(Ordering::Acquire)
+            .used_idx(mem.deref(), Ordering::Acquire)
             .map_err(EpollHelperError::QueueRingIndex)?
             < self.queue_pair[0]
-                .avail_idx(Ordering::Acquire)
+                .avail_idx(mem.deref(), Ordering::Acquire)
                 .map_err(EpollHelperError::QueueRingIndex)?
         {
             helper.add_event(self.net.tap.as_raw_fd(), RX_TAP_EVENT)?;
@@ -286,15 +305,18 @@ impl NetEpollHandler {
 }
 
 impl EpollHelperHandler for NetEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
             RX_QUEUE_EVENT => {
                 self.driver_awake = true;
-                if let Err(e) = self.handle_rx_event() {
-                    error!("Error processing RX queue: {:?}", e);
-                    return true;
-                }
+                self.handle_rx_event().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Error processing RX queue: {:?}", e))
+                })?;
             }
             TX_QUEUE_EVENT => {
                 let queue_evt = &self.queue_evt_pair[1];
@@ -302,80 +324,85 @@ impl EpollHelperHandler for NetEpollHandler {
                     error!("Failed to get tx queue event: {:?}", e);
                 }
                 self.driver_awake = true;
-                if let Err(e) = self.handle_tx_event() {
-                    error!("Error processing TX queue: {:?}", e);
-                    return true;
-                }
+                self.handle_tx_event().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Error processing TX queue: {:?}", e))
+                })?;
             }
             TX_TAP_EVENT => {
-                if let Err(e) = self.handle_tx_event() {
-                    error!("Error processing TX queue (TAP event): {:?}", e);
-                    return true;
-                }
+                self.handle_tx_event().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!(
+                        "Error processing TX queue (TAP event): {:?}",
+                        e
+                    ))
+                })?;
             }
             RX_TAP_EVENT => {
-                if let Err(e) = self.handle_rx_tap_event() {
-                    error!("Error processing tap queue: {:?}", e);
-                    return true;
-                }
+                self.handle_rx_tap_event().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Error processing tap queue: {:?}", e))
+                })?;
             }
             RX_RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.net.rx_rate_limiter {
                     // Upon rate limiter event, call the rate limiter handler and register the
                     // TAP fd for further processing if some RX buffers are available
-                    match rate_limiter.event_handler() {
-                        Ok(_) => {
-                            if !self.net.rx_tap_listening && self.net.rx_desc_avail {
-                                if let Err(e) = net_util::register_listener(
-                                    self.net.epoll_fd.unwrap(),
-                                    self.net.tap.as_raw_fd(),
-                                    epoll::Events::EPOLLIN,
-                                    u64::from(self.net.tap_rx_event_id),
-                                ) {
-                                    error!("Error register_listener with `RX_RATE_LIMITER_EVENT`: {:?}", e);
-                                    return true;
-                                }
-                                self.net.rx_tap_listening = true;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error from 'rate_limiter.event_handler()': {:?}", e);
-                            return true;
-                        }
+                    rate_limiter.event_handler().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Error from 'rate_limiter.event_handler()': {:?}",
+                            e
+                        ))
+                    })?;
+
+                    if !self.net.rx_tap_listening && self.net.rx_desc_avail {
+                        net_util::register_listener(
+                            self.net.epoll_fd.unwrap(),
+                            self.net.tap.as_raw_fd(),
+                            epoll::Events::EPOLLIN,
+                            u64::from(self.net.tap_rx_event_id),
+                        )
+                        .map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!(
+                                "Error register_listener with `RX_RATE_LIMITER_EVENT`: {:?}",
+                                e
+                            ))
+                        })?;
+
+                        self.net.rx_tap_listening = true;
                     }
                 } else {
-                    error!("Unexpected RX_RATE_LIMITER_EVENT");
-                    return true;
+                    return Err(EpollHelperError::HandleEvent(anyhow!(
+                        "Unexpected RX_RATE_LIMITER_EVENT"
+                    )));
                 }
             }
             TX_RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.net.tx_rate_limiter {
                     // Upon rate limiter event, call the rate limiter handler
                     // and restart processing the queue.
-                    match rate_limiter.event_handler() {
-                        Ok(_) => {
-                            self.driver_awake = true;
-                            if let Err(e) = self.process_tx() {
-                                error!("Error processing TX queue: {:?}", e);
-                                return true;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Error from 'rate_limiter.event_handler()': {:?}", e);
-                            return true;
-                        }
-                    }
+                    rate_limiter.event_handler().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Error from 'rate_limiter.event_handler()': {:?}",
+                            e
+                        ))
+                    })?;
+
+                    self.driver_awake = true;
+                    self.process_tx().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!("Error processing TX queue: {:?}", e))
+                    })?;
                 } else {
-                    error!("Unexpected TX_RATE_LIMITER_EVENT");
-                    return true;
+                    return Err(EpollHelperError::HandleEvent(anyhow!(
+                        "Unexpected TX_RATE_LIMITER_EVENT"
+                    )));
                 }
             }
             _ => {
-                error!("Unknown event: {}", ev_type);
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unexpected event: {}",
+                    ev_type
+                )));
             }
         }
-        false
+        Ok(())
     }
 }
 
@@ -404,7 +431,7 @@ impl VersionMapped for NetState {}
 impl Net {
     /// Create a new virtio network device with the given TAP interface.
     #[allow(clippy::too_many_arguments)]
-    pub fn new_with_tap(
+    fn new_with_tap(
         id: String,
         taps: Vec<Tap>,
         guest_mac: Option<MacAddr>,
@@ -415,6 +442,10 @@ impl Net {
         rate_limiter_config: Option<RateLimiterConfig>,
         exit_evt: EventFd,
     ) -> Result<Self> {
+        assert!(!taps.is_empty());
+
+        let mtu = taps[0].mtu().map_err(Error::TapError)? as u16;
+
         let mut avail_features = 1 << VIRTIO_NET_F_CSUM
             | 1 << VIRTIO_NET_F_CTRL_GUEST_OFFLOADS
             | 1 << VIRTIO_NET_F_GUEST_CSUM
@@ -426,6 +457,7 @@ impl Net {
             | 1 << VIRTIO_NET_F_HOST_TSO4
             | 1 << VIRTIO_NET_F_HOST_TSO6
             | 1 << VIRTIO_NET_F_HOST_UFO
+            | 1 << VIRTIO_NET_F_MTU
             | 1 << VIRTIO_RING_F_EVENT_IDX
             | 1 << VIRTIO_F_VERSION_1;
 
@@ -438,9 +470,9 @@ impl Net {
 
         let mut config = VirtioNetConfig::default();
         if let Some(mac) = guest_mac {
-            build_net_config_space(&mut config, mac, num_queues, &mut avail_features);
+            build_net_config_space(&mut config, mac, num_queues, Some(mtu), &mut avail_features);
         } else {
-            build_net_config_space_with_mq(&mut config, num_queues, &mut avail_features);
+            build_net_config_space_with_mq(&mut config, num_queues, Some(mtu), &mut avail_features);
         }
 
         Ok(Net {
@@ -473,6 +505,7 @@ impl Net {
         netmask: Option<Ipv4Addr>,
         guest_mac: Option<MacAddr>,
         host_mac: &mut Option<MacAddr>,
+        mtu: Option<u16>,
         iommu: bool,
         num_queues: usize,
         queue_size: u16,
@@ -480,8 +513,16 @@ impl Net {
         rate_limiter_config: Option<RateLimiterConfig>,
         exit_evt: EventFd,
     ) -> Result<Self> {
-        let taps = open_tap(if_name, ip_addr, netmask, host_mac, num_queues / 2, None)
-            .map_err(Error::OpenTap)?;
+        let taps = open_tap(
+            if_name,
+            ip_addr,
+            netmask,
+            host_mac,
+            mtu,
+            num_queues / 2,
+            None,
+        )
+        .map_err(Error::OpenTap)?;
 
         Self::new_with_tap(
             id,
@@ -501,6 +542,7 @@ impl Net {
         id: String,
         fds: &[RawFd],
         guest_mac: Option<MacAddr>,
+        mtu: Option<u16>,
         iommu: bool,
         queue_size: u16,
         seccomp_action: SeccompAction,
@@ -519,6 +561,12 @@ impl Net {
             }
             let tap = Tap::from_tap_fd(fd, num_queue_pairs).map_err(Error::TapError)?;
             taps.push(tap);
+        }
+
+        assert!(!taps.is_empty());
+
+        if let Some(mtu) = mtu {
+            taps[0].set_mtu(mtu as i32).map_err(Error::TapError)?;
         }
 
         Self::new_with_tap(
@@ -583,24 +631,23 @@ impl VirtioDevice for Net {
 
     fn activate(
         &mut self,
-        _mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        mut queue_evts: Vec<EventFd>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
 
         let num_queues = queues.len();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
         if self.common.feature_acked(VIRTIO_NET_F_CTRL_VQ.into()) && num_queues % 2 != 0 {
             let ctrl_queue_index = num_queues - 1;
-            let mut ctrl_queue = queues.remove(ctrl_queue_index);
-            let ctrl_queue_evt = queue_evts.remove(ctrl_queue_index);
+            let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index);
 
             ctrl_queue.set_event_idx(event_idx);
 
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
             let mut ctrl_handler = NetCtrlEpollHandler {
+                mem: mem.clone(),
                 kill_evt,
                 pause_evt,
                 ctrl_q: CtrlQueue::new(self.taps.clone()),
@@ -625,11 +672,7 @@ impl VirtioDevice for Net {
                 Thread::VirtioNetCtl,
                 &mut epoll_threads,
                 &self.exit_evt,
-                move || {
-                    if let Err(e) = ctrl_handler.run_ctrl(paused, paused_sync.unwrap()) {
-                        error!("Error running worker: {:?}", e);
-                    }
-                },
+                move || ctrl_handler.run_ctrl(paused, paused_sync.unwrap()),
             )?;
             self.ctrl_queue_epoll_thread = Some(epoll_threads.remove(0));
         }
@@ -641,11 +684,13 @@ impl VirtioDevice for Net {
             let tx = TxVirtio::new();
             let rx_tap_listening = false;
 
-            let mut queue_pair = vec![queues.remove(0), queues.remove(0)];
+            let (_, queue_0, queue_evt_0) = queues.remove(0);
+            let (_, queue_1, queue_evt_1) = queues.remove(0);
+            let mut queue_pair = vec![queue_0, queue_1];
             queue_pair[0].set_event_idx(event_idx);
             queue_pair[1].set_event_idx(event_idx);
 
-            let queue_evt_pair = vec![queue_evts.remove(0), queue_evts.remove(0)];
+            let queue_evt_pair = vec![queue_evt_0, queue_evt_1];
 
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
@@ -685,6 +730,7 @@ impl VirtioDevice for Net {
                     tx_rate_limiter,
                     access_platform: self.common.access_platform.clone(),
                 },
+                mem: mem.clone(),
                 queue_index_base: (i * 2) as u16,
                 queue_pair,
                 queue_evt_pair,
@@ -703,11 +749,7 @@ impl VirtioDevice for Net {
                 Thread::VirtioNet,
                 &mut epoll_threads,
                 &self.exit_evt,
-                move || {
-                    if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                        error!("Error running worker: {:?}", e);
-                    }
-                },
+                move || handler.run(paused, paused_sync.unwrap()),
             )?;
         }
 

@@ -101,6 +101,10 @@ fn parse_http_response(socket: &mut dyn Read) -> Result<Option<String>, Error> {
     loop {
         let mut bytes = vec![0; 256];
         let count = socket.read(&mut bytes).map_err(Error::Socket)?;
+        // If the return value is 0, the peer has performed an orderly shutdown.
+        if count == 0 {
+            break;
+        }
         res.push_str(std::str::from_utf8(&bytes[0..count]).unwrap());
 
         // End of headers
@@ -127,7 +131,7 @@ fn parse_http_response(socket: &mut dyn Read) -> Result<Option<String>, Error> {
             }
         }
     }
-    let body_string = content_length.and(Some(String::from(&res[body_offset.unwrap()..])));
+    let body_string = content_length.and(body_offset.map(|o| String::from(&res[o..])));
     let status_code = get_status_code(&res)?;
 
     if status_code.is_server_error() {
@@ -137,18 +141,20 @@ fn parse_http_response(socket: &mut dyn Read) -> Result<Option<String>, Error> {
     }
 }
 
-pub fn simple_api_command_with_fds<T: Read + Write + ScmSocket>(
+/// Make an API request using the fully qualified command name.
+/// For example, full_command could be "vm.create" or "vmm.ping".
+pub fn simple_api_full_command_with_fds_and_response<T: Read + Write + ScmSocket>(
     socket: &mut T,
     method: &str,
-    c: &str,
+    full_command: &str,
     request_body: Option<&str>,
     request_fds: Vec<RawFd>,
-) -> Result<(), Error> {
+) -> Result<Option<String>, Error> {
     socket
         .send_with_fds(
             &[format!(
-                "{} /api/v1/vm.{} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n",
-                method, c
+                "{} /api/v1/{} HTTP/1.1\r\nHost: localhost\r\nAccept: */*\r\n",
+                method, full_command
             )
             .as_bytes()],
             &request_fds,
@@ -171,10 +177,67 @@ pub fn simple_api_command_with_fds<T: Read + Write + ScmSocket>(
 
     socket.flush().map_err(Error::Socket)?;
 
-    if let Some(body) = parse_http_response(socket)? {
-        println!("{}", body);
+    parse_http_response(socket)
+}
+
+pub fn simple_api_full_command_with_fds<T: Read + Write + ScmSocket>(
+    socket: &mut T,
+    method: &str,
+    full_command: &str,
+    request_body: Option<&str>,
+    request_fds: Vec<RawFd>,
+) -> Result<(), Error> {
+    let response = simple_api_full_command_with_fds_and_response(
+        socket,
+        method,
+        full_command,
+        request_body,
+        request_fds,
+    )?;
+
+    if response.is_some() {
+        println!("{}", response.unwrap());
     }
+
     Ok(())
+}
+
+pub fn simple_api_full_command<T: Read + Write + ScmSocket>(
+    socket: &mut T,
+    method: &str,
+    full_command: &str,
+    request_body: Option<&str>,
+) -> Result<(), Error> {
+    simple_api_full_command_with_fds(socket, method, full_command, request_body, Vec::new())
+}
+
+pub fn simple_api_full_command_and_response<T: Read + Write + ScmSocket>(
+    socket: &mut T,
+    method: &str,
+    full_command: &str,
+    request_body: Option<&str>,
+) -> Result<Option<String>, Error> {
+    simple_api_full_command_with_fds_and_response(
+        socket,
+        method,
+        full_command,
+        request_body,
+        Vec::new(),
+    )
+}
+
+pub fn simple_api_command_with_fds<T: Read + Write + ScmSocket>(
+    socket: &mut T,
+    method: &str,
+    c: &str,
+    request_body: Option<&str>,
+    request_fds: Vec<RawFd>,
+) -> Result<(), Error> {
+    // Create the full VM command. For VMM commands, use
+    // simple_api_full_command().
+    let full_command = format!("vm.{}", c);
+
+    simple_api_full_command_with_fds(socket, method, &full_command, request_body, request_fds)
 }
 
 pub fn simple_api_command<T: Read + Write + ScmSocket>(

@@ -24,7 +24,6 @@ use std::process::{Child, Command, Stdio};
 use std::string::String;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
-#[cfg(target_arch = "x86_64")]
 use std::sync::Mutex;
 use std::thread;
 use test_infra::*;
@@ -59,6 +58,8 @@ mod aarch64 {
     pub const FOCAL_IMAGE_NAME_VHD: &str = "focal-server-cloudimg-arm64-custom-20210929-0.vhd";
     pub const FOCAL_IMAGE_NAME_VHDX: &str = "focal-server-cloudimg-arm64-custom-20210929-0.vhdx";
     pub const JAMMY_IMAGE_NAME: &str = "jammy-server-cloudimg-arm64-custom-20220329-0.raw";
+    pub const WINDOWS_IMAGE_NAME: &str = "windows-11-iot-enterprise-aarch64.raw";
+    pub const OVMF_NAME: &str = "CLOUDHV_EFI.fd";
     pub const GREP_SERIAL_IRQ_CMD: &str = "grep -c 'GICv3.*uart-pl011' /proc/interrupts || true";
     pub const GREP_PMU_IRQ_CMD: &str = "grep -c 'GICv3.*arm-pmu' /proc/interrupts || true";
 }
@@ -84,9 +85,9 @@ fn prepare_virtiofsd(tmp_dir: &TempDir, shared_dir: &str) -> (std::process::Chil
 
     // Start the daemon
     let child = Command::new(virtiofsd_path.as_str())
-        .args(&["--shared-dir", shared_dir])
-        .args(&["--socket-path", virtiofsd_socket_path.as_str()])
-        .args(&["--cache", "never"])
+        .args(["--shared-dir", shared_dir])
+        .args(["--socket-path", virtiofsd_socket_path.as_str()])
+        .args(["--cache", "never"])
         .spawn()
         .unwrap();
 
@@ -113,7 +114,7 @@ fn prepare_vubd(
 
     // Start the daemon
     let child = Command::new(clh_command("vhost_user_block"))
-        .args(&[
+        .args([
             "--block-backend",
             format!(
                 "path={},socket={},num_queues={},readonly={},direct={}",
@@ -175,12 +176,11 @@ fn direct_kernel_boot_path() -> PathBuf {
     kernel_path
 }
 
-#[cfg(target_arch = "aarch64")]
 fn edk2_path() -> PathBuf {
     let mut workload_path = dirs::home_dir().unwrap();
     workload_path.push("workloads");
     let mut edk2_path = workload_path;
-    edk2_path.push("CLOUDHV_EFI.fd");
+    edk2_path.push(OVMF_NAME);
 
     edk2_path
 }
@@ -202,26 +202,28 @@ fn prepare_vhost_user_net_daemon(
     tmp_dir: &TempDir,
     ip: &str,
     tap: Option<&str>,
+    mtu: Option<u16>,
     num_queues: usize,
     client_mode: bool,
 ) -> (std::process::Command, String) {
     let vunet_socket_path = String::from(tmp_dir.as_path().join("vunet.sock").to_str().unwrap());
 
     // Start the daemon
-    let net_params = if let Some(tap_str) = tap {
-        format!(
-            "tap={},ip={},mask=255.255.255.0,socket={},num_queues={},queue_size=1024,client={}",
-            tap_str, ip, vunet_socket_path, num_queues, client_mode
-        )
-    } else {
-        format!(
-            "ip={},mask=255.255.255.0,socket={},num_queues={},queue_size=1024,client={}",
-            ip, vunet_socket_path, num_queues, client_mode
-        )
-    };
+    let mut net_params = format!(
+        "ip={},mask=255.255.255.0,socket={},num_queues={},queue_size=1024,client={}",
+        ip, vunet_socket_path, num_queues, client_mode
+    );
+
+    if let Some(tap) = tap {
+        net_params.push_str(format!(",tap={}", tap).as_str());
+    }
+
+    if let Some(mtu) = mtu {
+        net_params.push_str(format!(",mtu={}", mtu).as_str());
+    }
 
     let mut command = Command::new(clh_command("vhost_user_net"));
-    command.args(&["--net-backend", net_params.as_str()]);
+    command.args(["--net-backend", net_params.as_str()]);
 
     (command, vunet_socket_path)
 }
@@ -248,7 +250,7 @@ fn curl_command(api_socket: &str, method: &str, url: &str, http_body: Option<&st
 
 fn remote_command(api_socket: &str, command: &str, arg: Option<&str>) -> bool {
     let mut cmd = Command::new(clh_command("ch-remote"));
-    cmd.args(&[&format!("--api-socket={}", api_socket), command]);
+    cmd.args([&format!("--api-socket={}", api_socket), command]);
 
     if let Some(arg) = arg {
         cmd.arg(arg);
@@ -266,7 +268,7 @@ fn remote_command(api_socket: &str, command: &str, arg: Option<&str>) -> bool {
 
 fn remote_command_w_output(api_socket: &str, command: &str, arg: Option<&str>) -> (bool, Vec<u8>) {
     let mut cmd = Command::new(clh_command("ch-remote"));
-    cmd.args(&[&format!("--api-socket={}", api_socket), command]);
+    cmd.args([&format!("--api-socket={}", api_socket), command]);
 
     if let Some(arg) = arg {
         cmd.arg(arg);
@@ -285,7 +287,7 @@ fn resize_command(
     event_file: Option<&str>,
 ) -> bool {
     let mut cmd = Command::new(clh_command("ch-remote"));
-    cmd.args(&[&format!("--api-socket={}", api_socket), "resize"]);
+    cmd.args([&format!("--api-socket={}", api_socket), "resize"]);
 
     if let Some(desired_vcpus) = desired_vcpus {
         cmd.arg(format!("--cpus={}", desired_vcpus));
@@ -320,7 +322,7 @@ fn resize_command(
 
 fn resize_zone_command(api_socket: &str, id: &str, desired_size: &str) -> bool {
     let mut cmd = Command::new(clh_command("ch-remote"));
-    cmd.args(&[
+    cmd.args([
         &format!("--api-socket={}", api_socket),
         "resize-zone",
         &format!("--id={}", id),
@@ -371,13 +373,13 @@ fn setup_ovs_dpdk_guests(
     };
 
     let mut child1 = GuestCommand::new_with_binary_path(guest1, &clh_path)
-                    .args(&["--cpus", "boot=2"])
-                    .args(&["--memory", "size=0,shared=on"])
-                    .args(&["--memory-zone", "id=mem0,size=1G,shared=on,host_numa_node=0"])
-                    .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-                    .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+                    .args(["--cpus", "boot=2"])
+                    .args(["--memory", "size=0,shared=on"])
+                    .args(["--memory-zone", "id=mem0,size=1G,shared=on,host_numa_node=0"])
+                    .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+                    .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
                     .default_disks()
-                    .args(&["--net", guest1.default_net_string().as_str(), "vhost_user=true,socket=/tmp/dpdkvhostclient1,num_queues=2,queue_size=256,vhost_mode=server"])
+                    .args(["--net", guest1.default_net_string().as_str(), "vhost_user=true,socket=/tmp/dpdkvhostclient1,num_queues=2,queue_size=256,vhost_mode=server"])
                     .capture_output()
                     .spawn()
                     .unwrap();
@@ -421,14 +423,14 @@ fn setup_ovs_dpdk_guests(
     }
 
     let mut child2 = GuestCommand::new_with_binary_path(guest2, &clh_path)
-                    .args(&["--api-socket", api_socket])
-                    .args(&["--cpus", "boot=2"])
-                    .args(&["--memory", "size=0,shared=on"])
-                    .args(&["--memory-zone", "id=mem0,size=1G,shared=on,host_numa_node=0"])
-                    .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-                    .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+                    .args(["--api-socket", api_socket])
+                    .args(["--cpus", "boot=2"])
+                    .args(["--memory", "size=0,shared=on"])
+                    .args(["--memory-zone", "id=mem0,size=1G,shared=on,host_numa_node=0"])
+                    .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+                    .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
                     .default_disks()
-                    .args(&["--net", guest2.default_net_string().as_str(), "vhost_user=true,socket=/tmp/dpdkvhostclient2,num_queues=2,queue_size=256,vhost_mode=server"])
+                    .args(["--net", guest2.default_net_string().as_str(), "vhost_user=true,socket=/tmp/dpdkvhostclient2,num_queues=2,queue_size=256,vhost_mode=server"])
                     .capture_output()
                     .spawn()
                     .unwrap();
@@ -584,16 +586,16 @@ fn test_cpu_topology(threads_per_core: u8, cores_per_package: u8, packages: u8, 
     }
 
     let mut child = GuestCommand::new(&guest)
-        .args(&[
+        .args([
             "--cpus",
             &format!(
                 "boot={},topology={}:{}:1:{}",
                 total_vcpus, threads_per_core, cores_per_package, packages
             ),
         ])
-        .args(&["--memory", "size=512M"])
-        .args(&["--kernel", kernel_path])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args(["--memory", "size=512M"])
+        .args(["--kernel", kernel_path])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
         .default_disks()
         .default_net()
         .capture_output()
@@ -658,23 +660,23 @@ fn _test_guest_numa_nodes(acpi: bool) {
     };
 
     let mut child = GuestCommand::new(&guest)
-        .args(&["--cpus", "boot=6,max=12"])
-        .args(&["--memory", "size=0,hotplug_method=virtio-mem"])
-        .args(&[
+        .args(["--cpus", "boot=6,max=12"])
+        .args(["--memory", "size=0,hotplug_method=virtio-mem"])
+        .args([
             "--memory-zone",
             "id=mem0,size=1G,hotplug_size=3G",
             "id=mem1,size=2G,hotplug_size=3G",
             "id=mem2,size=3G,hotplug_size=3G",
         ])
-        .args(&[
+        .args([
             "--numa",
             "guest_numa_id=0,cpus=[0-2,9],distances=[1@15,2@20],memory_zones=mem0",
             "guest_numa_id=1,cpus=[3-4,6-8],distances=[0@20,2@25],memory_zones=mem1",
             "guest_numa_id=2,cpus=[5,10-11],distances=[0@25,1@30],memory_zones=mem2",
         ])
-        .args(&["--kernel", kernel_path.to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-        .args(&["--api-socket", &api_socket])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args(["--api-socket", &api_socket])
         .capture_output()
         .default_disks()
         .default_net()
@@ -736,14 +738,14 @@ fn _test_power_button(acpi: bool) {
         direct_kernel_boot_path()
     };
 
-    cmd.args(&["--cpus", "boot=1"])
-        .args(&["--memory", "size=512M"])
-        .args(&["--kernel", kernel_path.to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+    cmd.args(["--cpus", "boot=1"])
+        .args(["--memory", "size=512M"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
         .capture_output()
         .default_disks()
         .default_net()
-        .args(&["--api-socket", &api_socket]);
+        .args(["--api-socket", &api_socket]);
 
     let child = cmd.spawn().unwrap();
 
@@ -757,8 +759,14 @@ fn _test_power_button(acpi: bool) {
     handle_child_output(r, &output);
 }
 
-type PrepareNetDaemon =
-    dyn Fn(&TempDir, &str, Option<&str>, usize, bool) -> (std::process::Command, String);
+type PrepareNetDaemon = dyn Fn(
+    &TempDir,
+    &str,
+    Option<&str>,
+    Option<u16>,
+    usize,
+    bool,
+) -> (std::process::Command, String);
 
 fn test_vhost_user_net(
     tap: Option<&str>,
@@ -779,16 +787,19 @@ fn test_vhost_user_net(
         None
     };
 
+    let mtu = Some(3000);
+
     let (mut daemon_command, vunet_socket_path) = prepare_daemon(
         &guest.tmp_dir,
         &guest.network.host_ip,
         tap,
+        mtu,
         num_queues,
         client_mode_daemon,
     );
 
     let net_params = format!(
-        "vhost_user=true,mac={},socket={},num_queues={},queue_size=1024{},vhost_mode={}",
+        "vhost_user=true,mac={},socket={},num_queues={},queue_size=1024{},vhost_mode={},mtu=3000",
         guest.network.guest_mac,
         vunet_socket_path,
         num_queues,
@@ -806,13 +817,13 @@ fn test_vhost_user_net(
 
     let mut ch_command = GuestCommand::new(&guest);
     ch_command
-        .args(&["--cpus", format!("boot={}", num_queues / 2).as_str()])
-        .args(&["--memory", "size=512M,hotplug_size=2048M,shared=on"])
-        .args(&["--kernel", kernel_path.to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args(["--cpus", format!("boot={}", num_queues / 2).as_str()])
+        .args(["--memory", "size=512M,hotplug_size=2048M,shared=on"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
         .default_disks()
-        .args(&["--net", net_params.as_str()])
-        .args(&["--api-socket", &api_socket])
+        .args(["--net", net_params.as_str()])
+        .args(["--api-socket", &api_socket])
         .capture_output();
 
     let mut daemon_child: std::process::Child;
@@ -842,6 +853,19 @@ fn test_vhost_user_net(
             let mac_count = exec_host_command_output(&format!("ip link | grep -c {}", host_mac));
             assert_eq!(String::from_utf8_lossy(&mac_count.stdout).trim(), "1");
         }
+
+        #[cfg(target_arch = "aarch64")]
+        let iface = "enp0s4";
+        #[cfg(target_arch = "x86_64")]
+        let iface = "ens4";
+
+        assert_eq!(
+            guest
+                .ssh_command(format!("cat /sys/class/net/{}/mtu", iface).as_str())
+                .unwrap()
+                .trim(),
+            "3000"
+        );
 
         // 1 network interface + default localhost ==> 2 interfaces
         // It's important to note that this test is fully exercising the
@@ -940,11 +964,11 @@ fn test_vhost_user_blk(
     };
 
     let mut child = GuestCommand::new(&guest)
-        .args(&["--cpus", format!("boot={}", num_queues).as_str()])
-        .args(&["--memory", "size=512M,hotplug_size=2048M,shared=on"])
-        .args(&["--kernel", kernel_path.to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-        .args(&[
+        .args(["--cpus", format!("boot={}", num_queues).as_str()])
+        .args(["--memory", "size=512M,hotplug_size=2048M,shared=on"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args([
             "--disk",
             format!(
                 "path={}",
@@ -959,7 +983,7 @@ fn test_vhost_user_blk(
             blk_params.as_str(),
         ])
         .default_net()
-        .args(&["--api-socket", &api_socket])
+        .args(["--api-socket", &api_socket])
         .capture_output()
         .spawn()
         .unwrap();
@@ -1093,11 +1117,11 @@ fn test_boot_from_vhost_user_blk(
     };
 
     let mut child = GuestCommand::new(&guest)
-        .args(&["--cpus", format!("boot={}", num_queues).as_str()])
-        .args(&["--memory", "size=512M,shared=on"])
-        .args(&["--kernel", kernel_path.to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-        .args(&[
+        .args(["--cpus", format!("boot={}", num_queues).as_str()])
+        .args(["--memory", "size=512M,shared=on"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args([
             "--disk",
             blk_boot_params.as_str(),
             format!(
@@ -1167,15 +1191,15 @@ fn _test_virtio_fs(
 
     let mut guest_command = GuestCommand::new(&guest);
     guest_command
-        .args(&["--cpus", "boot=1"])
-        .args(&["--memory", "size=512M,hotplug_size=2048M,shared=on"])
-        .args(&["--kernel", kernel_path.to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args(["--cpus", "boot=1"])
+        .args(["--memory", "size=512M,hotplug_size=2048M,shared=on"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
         .default_disks()
         .default_net()
-        .args(&["--api-socket", &api_socket]);
+        .args(["--api-socket", &api_socket]);
     if pci_segment.is_some() {
-        guest_command.args(&["--platform", "num_pci_segments=16"]);
+        guest_command.args(["--platform", "num_pci_segments=16"]);
     }
 
     let fs_params = format!(
@@ -1189,7 +1213,7 @@ fn _test_virtio_fs(
     );
 
     if !hotplug {
-        guest_command.args(&["--fs", fs_params.as_str()]);
+        guest_command.args(["--fs", fs_params.as_str()]);
     }
 
     let mut child = guest_command.capture_output().spawn().unwrap();
@@ -1342,13 +1366,13 @@ fn test_virtio_pmem(discard_writes: bool, specify_size: bool) {
         .expect("Expect creating disk image to succeed");
 
     let mut child = GuestCommand::new(&guest)
-        .args(&["--cpus", "boot=1"])
-        .args(&["--memory", "size=512M"])
-        .args(&["--kernel", kernel_path.to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args(["--cpus", "boot=1"])
+        .args(["--memory", "size=512M"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
         .default_disks()
         .default_net()
-        .args(&[
+        .args([
             "--pmem",
             format!(
                 "file={}{}{}",
@@ -1422,16 +1446,16 @@ fn _test_virtio_vsock(hotplug: bool) {
     let api_socket = temp_api_path(&guest.tmp_dir);
 
     let mut cmd = GuestCommand::new(&guest);
-    cmd.args(&["--api-socket", &api_socket]);
-    cmd.args(&["--cpus", "boot=1"]);
-    cmd.args(&["--memory", "size=512M"]);
-    cmd.args(&["--kernel", kernel_path.to_str().unwrap()]);
-    cmd.args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE]);
+    cmd.args(["--api-socket", &api_socket]);
+    cmd.args(["--cpus", "boot=1"]);
+    cmd.args(["--memory", "size=512M"]);
+    cmd.args(["--kernel", kernel_path.to_str().unwrap()]);
+    cmd.args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE]);
     cmd.default_disks();
     cmd.default_net();
 
     if !hotplug {
-        cmd.args(&["--vsock", format!("cid=3,socket={}", socket).as_str()]);
+        cmd.args(["--vsock", format!("cid=3,socket={}", socket).as_str()]);
     }
 
     let mut child = cmd.capture_output().spawn().unwrap();
@@ -1496,13 +1520,13 @@ fn test_memory_mergeable(mergeable: bool) {
     let focal1 = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
     let guest1 = Guest::new(Box::new(focal1));
     let mut child1 = GuestCommand::new(&guest1)
-        .args(&["--cpus", "boot=1"])
-        .args(&["--memory", format!("size=512M,{}", memory_param).as_str()])
-        .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args(["--cpus", "boot=1"])
+        .args(["--memory", format!("size=512M,{}", memory_param).as_str()])
+        .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
         .default_disks()
-        .args(&["--net", guest1.default_net_string().as_str()])
-        .args(&["--serial", "tty", "--console", "off"])
+        .args(["--net", guest1.default_net_string().as_str()])
+        .args(["--serial", "tty", "--console", "off"])
         .capture_output()
         .spawn()
         .unwrap();
@@ -1522,13 +1546,13 @@ fn test_memory_mergeable(mergeable: bool) {
     let focal2 = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
     let guest2 = Guest::new(Box::new(focal2));
     let mut child2 = GuestCommand::new(&guest2)
-        .args(&["--cpus", "boot=1"])
-        .args(&["--memory", format!("size=512M,{}", memory_param).as_str()])
-        .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args(["--cpus", "boot=1"])
+        .args(["--memory", format!("size=512M,{}", memory_param).as_str()])
+        .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
         .default_disks()
-        .args(&["--net", guest2.default_net_string().as_str()])
-        .args(&["--serial", "tty", "--console", "off"])
+        .args(["--net", guest2.default_net_string().as_str()])
+        .args(["--serial", "tty", "--console", "off"])
         .capture_output()
         .spawn()
         .unwrap();
@@ -1774,11 +1798,11 @@ fn _test_virtio_iommu(acpi: bool) {
     };
 
     let mut child = GuestCommand::new(&guest)
-        .args(&["--cpus", "boot=1"])
-        .args(&["--memory", "size=512M"])
-        .args(&["--kernel", kernel_path.to_str().unwrap()])
-        .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-        .args(&[
+        .args(["--cpus", "boot=1"])
+        .args(["--memory", "size=512M"])
+        .args(["--kernel", kernel_path.to_str().unwrap()])
+        .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        .args([
             "--disk",
             format!(
                 "path={},iommu=on",
@@ -1791,7 +1815,7 @@ fn _test_virtio_iommu(acpi: bool) {
             )
             .as_str(),
         ])
-        .args(&["--net", guest.default_net_string_w_iommu().as_str()])
+        .args(["--net", guest.default_net_string_w_iommu().as_str()])
         .capture_output()
         .spawn()
         .unwrap();
@@ -1857,7 +1881,19 @@ fn _test_virtio_iommu(acpi: bool) {
     handle_child_output(r, &output);
 }
 
-fn enable_guest_watchdog(guest: &Guest, current_reboot_count: &mut u32) {
+fn get_reboot_count(guest: &Guest) -> u32 {
+    // Ensure that the current boot journal is written so reboot counts are valid
+    guest.ssh_command("sudo journalctl --sync").unwrap();
+
+    guest
+        .ssh_command("sudo journalctl --list-boots | wc -l")
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap_or_default()
+}
+
+fn enable_guest_watchdog(guest: &Guest, watchdog_sec: u32) {
     // Check for PCI device
     assert!(guest
         .does_device_vendor_pair_match("0x1063", "0x1af4")
@@ -1865,93 +1901,15 @@ fn enable_guest_watchdog(guest: &Guest, current_reboot_count: &mut u32) {
 
     // Enable systemd watchdog
     guest
-        .ssh_command("echo RuntimeWatchdogSec=15s | sudo tee -a /etc/systemd/system.conf")
+        .ssh_command(&format!(
+            "echo RuntimeWatchdogSec={}s | sudo tee -a /etc/systemd/system.conf",
+            watchdog_sec
+        ))
         .unwrap();
-
-    guest.ssh_command("sudo reboot").unwrap();
-
-    guest.wait_vm_boot(None).unwrap();
-
-    // Check that systemd has activated the watchdog
-    assert_eq!(
-        guest
-            .ssh_command("sudo journalctl | grep -c -- \"Watchdog started\"")
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap_or_default(),
-        2
-    );
-
-    // Ensure that the current boot journal is written so reboot counts are valid
-    guest.ssh_command("sudo journalctl --sync").unwrap();
-
-    *current_reboot_count += 1;
-
-    let boot_count = guest
-        .ssh_command("sudo journalctl --list-boots | wc -l")
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap_or_default();
-    assert_eq!(boot_count, *current_reboot_count);
 }
 
-fn check_guest_watchdog_no_reboot(guest: &Guest, current_reboot_count: &u32) {
-    // Allow some normal time to elapse to check we don't get spurious reboots
-    thread::sleep(std::time::Duration::new(40, 0));
-
-    // Check no reboot
-    let boot_count = guest
-        .ssh_command("sudo journalctl --list-boots | wc -l")
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap_or_default();
-    assert_eq!(boot_count, *current_reboot_count);
-}
-
-fn check_guest_watchdog_one_reboot(
-    guest: &Guest,
-    _api_socket: &str,
-    current_reboot_count: &mut u32,
-) {
-    // Trigger a panic (sync first). We need to do this inside a screen with a delay so the SSH command returns.
-    guest.ssh_command("screen -dmS reboot sh -c \"sleep 5; echo s | tee /proc/sysrq-trigger; echo c | sudo tee /proc/sysrq-trigger\"").unwrap();
-
-    // Allow some time for the watchdog to trigger (max 30s) and reboot to happen
-    guest.wait_vm_boot(Some(50)).unwrap();
-
-    // Check that watchdog triggered reboot
-    *current_reboot_count += 1;
-    let boot_count = guest
-        .ssh_command("sudo journalctl --list-boots | wc -l")
-        .unwrap()
-        .trim()
-        .parse::<u32>()
-        .unwrap_or_default();
-    assert_eq!(boot_count, *current_reboot_count);
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Now pause the VM and remain offline for 30s
-        assert!(remote_command(_api_socket, "pause", None));
-        thread::sleep(std::time::Duration::new(30, 0));
-        assert!(remote_command(_api_socket, "resume", None));
-
-        // Check no reboot
-        let boot_count = guest
-            .ssh_command("sudo journalctl --list-boots | wc -l")
-            .unwrap()
-            .trim()
-            .parse::<u32>()
-            .unwrap_or_default();
-        assert_eq!(boot_count, *current_reboot_count);
-    }
-}
-
-mod parallel {
-    use std::io::SeekFrom;
+mod common_parallel {
+    use std::{fs::OpenOptions, io::SeekFrom};
 
     use crate::*;
 
@@ -1986,13 +1944,13 @@ mod parallel {
         let event_path = temp_event_monitor_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", fw_path.as_str()])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", fw_path.as_str()])
             .default_disks()
             .default_net()
-            .args(&["--serial", "tty", "--console", "off"])
-            .args(&["--event-monitor", format!("path={}", event_path).as_str()])
+            .args(["--serial", "tty", "--console", "off"])
+            .args(["--event-monitor", format!("path={}", event_path).as_str()])
             .capture_output()
             .spawn()
             .unwrap();
@@ -2032,8 +1990,16 @@ mod parallel {
                 &event_path
             ));
 
+            // It's been observed on the Bionic image that udev and snapd
+            // services can cause some delay in the VM's shutdown. Disabling
+            // them improves the reliability of this test.
+            let _ = guest.ssh_command("sudo systemctl disable udev");
+            let _ = guest.ssh_command("sudo systemctl stop udev");
+            let _ = guest.ssh_command("sudo systemctl disable snapd");
+            let _ = guest.ssh_command("sudo systemctl stop snapd");
+
             guest.ssh_command("sudo poweroff").unwrap();
-            thread::sleep(std::time::Duration::new(5, 0));
+            thread::sleep(std::time::Duration::new(10, 0));
             let latest_events = [
                 &MetaEvent {
                     event: "shutdown".to_string(),
@@ -2062,10 +2028,10 @@ mod parallel {
         let bionic = UbuntuDiskConfig::new(BIONIC_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(bionic));
         let mut cmd = GuestCommand::new(&guest);
-        cmd.args(&["--cpus", "boot=2,max=4"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        cmd.args(["--cpus", "boot=2,max=4"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .capture_output()
             .default_disks()
             .default_net();
@@ -2127,10 +2093,10 @@ mod parallel {
         let guest = Guest::new(Box::new(focal));
         let max_phys_bits: u8 = 36;
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", &format!("max_phys_bits={}", max_phys_bits)])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", &format!("max_phys_bits={}", max_phys_bits)])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
             .capture_output()
@@ -2173,10 +2139,10 @@ mod parallel {
         );
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=2,affinity=[0@[0,2],1@[1,3]]"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=2,affinity=[0@[0,2],1@[1,3]]"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
             .capture_output()
@@ -2204,12 +2170,12 @@ mod parallel {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
         let mut cmd = GuestCommand::new(&guest);
-        cmd.args(&["--cpus", "boot=48"])
-            .args(&["--memory", "size=5120M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+        cmd.args(["--cpus", "boot=48"])
+            .args(["--memory", "size=5120M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .capture_output()
             .default_disks()
             .default_net();
@@ -2243,10 +2209,10 @@ mod parallel {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
         let mut cmd = GuestCommand::new(&guest);
-        cmd.args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=128G"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        cmd.args(["--cpus", "boot=1"])
+            .args(["--memory", "size=128G"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .capture_output()
             .default_disks()
             .default_net();
@@ -2280,17 +2246,17 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=0,hotplug_method=virtio-mem"])
-            .args(&[
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=0,hotplug_method=virtio-mem"])
+            .args([
                 "--memory-zone",
                 "id=mem0,size=1G,hotplug_size=2G",
                 "id=mem1,size=1G,file=/dev/shm",
                 "id=mem2,size=1G,host_numa_node=0,hotplug_size=2G",
             ])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&["--api-socket", &api_socket])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .default_disks()
             .default_net()
@@ -2371,12 +2337,12 @@ mod parallel {
         let api_socket = temp_api_path(&guest.tmp_dir);
         let mut cmd = GuestCommand::new(&guest);
 
-        cmd.args(&["--cpus", "boot=1"])
-            .args(&["--api-socket", &api_socket])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&["--platform", "num_pci_segments=16,iommu_segments=[1]"])
+        cmd.args(["--cpus", "boot=1"])
+            .args(["--api-socket", &api_socket])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--platform", "num_pci_segments=16,iommu_segments=[1]"])
             .default_disks()
             .capture_output()
             .default_net();
@@ -2425,10 +2391,10 @@ mod parallel {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
         let mut cmd = GuestCommand::new(&guest);
-        cmd.args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        cmd.args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .capture_output()
             .default_disks()
             .default_net();
@@ -2465,13 +2431,13 @@ mod parallel {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
         let mut cmd = GuestCommand::new(&guest);
-        cmd.args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        cmd.args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--net", guest.default_net_string_w_mtu(3000).as_str()])
             .capture_output()
-            .default_disks()
-            .default_net();
+            .default_disks();
 
         let mut child = cmd.spawn().unwrap();
 
@@ -2491,6 +2457,13 @@ mod parallel {
                     .unwrap()
                     .trim(),
                 "success"
+            );
+            assert_eq!(
+                guest
+                    .ssh_command(format!("cat /sys/class/net/{}/mtu", iface).as_str())
+                    .unwrap()
+                    .trim(),
+                "3000"
             );
         });
 
@@ -2524,12 +2497,12 @@ mod parallel {
         );
 
         let mut cmd = GuestCommand::new(&guest);
-        cmd.args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&["--platform", "num_pci_segments=16"])
-            .args(&[
+        cmd.args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--platform", "num_pci_segments=16"])
+            .args([
                 "--disk",
                 format!(
                     "path={}",
@@ -2613,10 +2586,10 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
             .capture_output()
@@ -2664,11 +2637,11 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut cloud_child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=4"])
-            .args(&["--memory", "size=512M,shared=on"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&[
+            .args(["--cpus", "boot=4"])
+            .args(["--memory", "size=512M,shared=on"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args([
                 "--disk",
                 format!(
                     "path={}",
@@ -2764,9 +2737,9 @@ mod parallel {
         std::process::Command::new("qemu-img")
             .arg("convert")
             .arg("-p")
-            .args(&["-f", "raw"])
-            .args(&["-O", "vpc"])
-            .args(&["-o", "subformat=fixed"])
+            .args(["-f", "raw"])
+            .args(["-O", "vpc"])
+            .args(["-o", "subformat=fixed"])
             .arg(raw_file_path.to_str().unwrap())
             .arg(vhd_file_path.to_str().unwrap())
             .output()
@@ -2789,8 +2762,8 @@ mod parallel {
         std::process::Command::new("qemu-img")
             .arg("convert")
             .arg("-p")
-            .args(&["-f", "raw"])
-            .args(&["-O", "vhdx"])
+            .args(["-f", "raw"])
+            .args(["-O", "vhdx"])
             .arg(raw_file_path.to_str().unwrap())
             .arg(vhdx_file_path.to_str().unwrap())
             .output()
@@ -2816,7 +2789,7 @@ mod parallel {
         // Generate a 100 MiB dynamic VHDX file
         std::process::Command::new("qemu-img")
             .arg("create")
-            .args(&["-f", "vhdx"])
+            .args(["-f", "vhdx"])
             .arg(vhdx_path)
             .arg(VIRTUAL_DISK_SIZE.to_string())
             .output()
@@ -2830,11 +2803,11 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut cloud_child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&[
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args([
                 "--disk",
                 format!(
                     "path={}",
@@ -2909,10 +2882,10 @@ mod parallel {
         .expect("copying of OS disk failed");
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
-            .args(&[
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
+            .args([
                 "--disk",
                 format!("path={},direct=on", os_path.as_path().to_str().unwrap()).as_str(),
                 format!(
@@ -3016,10 +2989,10 @@ mod parallel {
         let guest = Guest::new(Box::new(focal));
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
             .capture_output()
@@ -3062,11 +3035,11 @@ mod parallel {
         let guest = Guest::new(Box::new(focal));
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&["--platform", "serial_number=a=b;c=d"])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--platform", "serial_number=a=b;c=d"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -3082,6 +3055,99 @@ mod parallel {
                     .unwrap()
                     .trim(),
                 "a=b;c=d"
+            );
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_dmi_uuid() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--platform", "uuid=1e8aa28a-435d-4027-87f4-40dceff1fa0a"])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            assert_eq!(
+                guest
+                    .ssh_command("sudo cat /sys/class/dmi/id/product_uuid")
+                    .unwrap()
+                    .trim(),
+                "1e8aa28a-435d-4027-87f4-40dceff1fa0a"
+            );
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_dmi_oem_strings() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        let s1 = "io.systemd.credential:xx=yy";
+        let s2 = "This is a test string";
+
+        let oem_strings = format!("oem_strings=[{},{}]", s1, s2);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--platform", &oem_strings])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            assert_eq!(
+                guest
+                    .ssh_command("sudo dmidecode --oem-string count")
+                    .unwrap()
+                    .trim(),
+                "2"
+            );
+
+            assert_eq!(
+                guest
+                    .ssh_command("sudo dmidecode --oem-string 1")
+                    .unwrap()
+                    .trim(),
+                s1
+            );
+
+            assert_eq!(
+                guest
+                    .ssh_command("sudo dmidecode --oem-string 2")
+                    .unwrap()
+                    .trim(),
+                s2
             );
         });
 
@@ -3136,10 +3202,10 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&[
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args([
                 "--disk",
                 format!(
                     "path={}",
@@ -3148,7 +3214,7 @@ mod parallel {
                 .as_str(),
             ])
             .default_net()
-            .args(&[
+            .args([
                 "--pmem",
                 format!(
                     "file={},size={}",
@@ -3159,7 +3225,7 @@ mod parallel {
                 )
                 .as_str(),
             ])
-            .args(&[
+            .args([
                 "--cmdline",
                 DIRECT_KERNEL_BOOT_CMDLINE
                     .replace("vda1", "pmem0p1")
@@ -3191,12 +3257,12 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
-            .args(&[
+            .args([
                 "--net",
                 guest.default_net_string().as_str(),
                 "tap=,mac=8a:6b:6f:5a:de:ac,ip=192.168.3.1,mask=255.255.255.0",
@@ -3236,10 +3302,10 @@ mod parallel {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
             .capture_output()
@@ -3272,13 +3338,13 @@ mod parallel {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&["--serial", "off"])
+            .args(["--serial", "off"])
             .capture_output()
             .spawn()
             .unwrap();
@@ -3314,10 +3380,10 @@ mod parallel {
         #[cfg(target_arch = "aarch64")]
         let console_str: &str = "console=ttyAMA0";
 
-        cmd.args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&[
+        cmd.args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args([
                 "--cmdline",
                 DIRECT_KERNEL_BOOT_CMDLINE
                     .replace("console=hvc0 ", console_str)
@@ -3325,8 +3391,8 @@ mod parallel {
             ])
             .default_disks()
             .default_net()
-            .args(&["--serial", "null"])
-            .args(&["--console", "off"])
+            .args(["--serial", "null"])
+            .args(["--console", "off"])
             .capture_output();
 
         let mut child = cmd.spawn().unwrap();
@@ -3370,10 +3436,10 @@ mod parallel {
         let console_str: &str = "console=ttyAMA0";
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&[
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args([
                 "--cmdline",
                 DIRECT_KERNEL_BOOT_CMDLINE
                     .replace("console=hvc0 ", console_str)
@@ -3381,8 +3447,8 @@ mod parallel {
             ])
             .default_disks()
             .default_net()
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .capture_output()
             .spawn()
             .unwrap();
@@ -3428,10 +3494,10 @@ mod parallel {
         let console_str: &str = "console=ttyAMA0";
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&[
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args([
                 "--cmdline",
                 DIRECT_KERNEL_BOOT_CMDLINE
                     .replace("console=hvc0 ", console_str)
@@ -3439,7 +3505,7 @@ mod parallel {
             ])
             .default_disks()
             .default_net()
-            .args(&[
+            .args([
                 "--serial",
                 format!("file={}", serial_path.to_str().unwrap()).as_str(),
             ])
@@ -3497,15 +3563,15 @@ mod parallel {
         let cmdline = DIRECT_KERNEL_BOOT_CMDLINE.to_owned() + serial_option;
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", &cmdline])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", &cmdline])
             .default_disks()
             .default_net()
-            .args(&["--serial", "null"])
-            .args(&["--console", "pty"])
-            .args(&["--api-socket", &api_socket])
+            .args(["--serial", "null"])
+            .args(["--console", "pty"])
+            .args(["--api-socket", &api_socket])
             .spawn()
             .unwrap();
 
@@ -3579,14 +3645,14 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&["--console", "tty"])
-            .args(&["--serial", "null"])
+            .args(["--console", "tty"])
+            .args(["--serial", "null"])
             .capture_output()
             .spawn()
             .unwrap();
@@ -3622,13 +3688,13 @@ mod parallel {
 
         let console_path = guest.tmp_dir.as_path().join("/tmp/console-output");
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&[
+            .args([
                 "--console",
                 format!("file={}", console_path.to_str().unwrap()).as_str(),
             ])
@@ -3669,6 +3735,7 @@ mod parallel {
     #[test]
     #[cfg(target_arch = "x86_64")]
     #[cfg(not(feature = "mshv"))]
+    #[ignore = "See #4324"]
     // The VFIO integration test starts cloud-hypervisor guest with 3 TAP
     // backed networking interfaces, bound through a simple bridge on the host.
     // So if the nested cloud-hypervisor succeeds in getting a directly
@@ -3729,10 +3796,10 @@ mod parallel {
         let vfio_tap3 = "vfio-tap3";
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=4"])
-            .args(&["--memory", "size=2G,hugepages=on,shared=on"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&[
+            .args(["--cpus", "boot=4"])
+            .args(["--memory", "size=2G,hugepages=on,shared=on"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args([
                 "--disk",
                 format!(
                     "path={}",
@@ -3747,7 +3814,7 @@ mod parallel {
                 format!("path={}", vfio_disk_path.to_str().unwrap()).as_str(),
                 format!("path={},iommu=on", blk_file_path.to_str().unwrap()).as_str(),
             ])
-            .args(&[
+            .args([
                 "--cmdline",
                 format!(
                     "{} kvm-intel.nested=1 vfio_iommu_type1.allow_unsafe_interrupts",
@@ -3755,7 +3822,7 @@ mod parallel {
                 )
                 .as_str(),
             ])
-            .args(&[
+            .args([
                 "--net",
                 format!("tap={},mac={}", vfio_tap0, guest.network.guest_mac).as_str(),
                 format!(
@@ -3939,10 +4006,10 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&[
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args([
                 "--cmdline",
                 format!("{} acpi=off", DIRECT_KERNEL_BOOT_CMDLINE).as_str(),
             ])
@@ -3976,10 +4043,10 @@ mod parallel {
                 let guest = Guest::new(disk_config);
 
                 let mut cmd = GuestCommand::new(&guest);
-                cmd.args(&["--cpus", "boot=1"])
-                    .args(&["--memory", "size=512M"])
-                    .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-                    .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+                cmd.args(["--cpus", "boot=1"])
+                    .args(["--memory", "size=512M"])
+                    .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+                    .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
                     .default_disks()
                     .default_net()
                     .capture_output();
@@ -4031,7 +4098,7 @@ mod parallel {
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &api_socket])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -4085,7 +4152,7 @@ mod parallel {
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &api_socket])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -4103,25 +4170,30 @@ mod parallel {
             DIRECT_KERNEL_BOOT_CMDLINE,
         );
 
-        curl_command(
-            &api_socket,
-            "PUT",
-            "http://localhost/api/v1/vm.create",
-            Some(&http_body),
-        );
-
-        // Then boot it
-        curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
-
         let r = std::panic::catch_unwind(|| {
+            curl_command(
+                &api_socket,
+                "PUT",
+                "http://localhost/api/v1/vm.create",
+                Some(&http_body),
+            );
+
+            // Then boot it
+            curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
+
             guest.wait_vm_boot(None).unwrap();
 
             // Check that the VM booted as expected
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
 
-            // Shutdown without powering off to prevent filesystem corruption
+            // Sync and shutdown without powering off to prevent filesystem
+            // corruption.
+            guest.ssh_command("sync").unwrap();
             guest.ssh_command("sudo shutdown -H now").unwrap();
+
+            // Wait for the guest to be fully shutdown
+            thread::sleep(std::time::Duration::new(20, 0));
 
             // Then shut it down
             curl_command(
@@ -4158,7 +4230,7 @@ mod parallel {
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &api_socket])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -4193,8 +4265,13 @@ mod parallel {
             assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
 
-            // Shutdown without powering off to prevent filesystem corruption
+            // Sync and shutdown without powering off to prevent filesystem
+            // corruption.
+            guest.ssh_command("sync").unwrap();
             guest.ssh_command("sudo shutdown -H now").unwrap();
+
+            // Wait for the guest to be fully shutdown
+            thread::sleep(std::time::Duration::new(20, 0));
 
             // Then delete it
             curl_command(
@@ -4239,7 +4316,7 @@ mod parallel {
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &api_socket])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -4332,12 +4409,12 @@ mod parallel {
         let kernel_path = edk2_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
-            .args(&[
+            .args([
                 "--net",
                 guest.default_net_string().as_str(),
                 "tap=,mac=8a:6b:6f:5a:de:ac,ip=192.168.3.1,mask=255.255.255.0",
@@ -4431,13 +4508,13 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=2,max=4"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=2,max=4"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&["--api-socket", &api_socket])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -4519,14 +4596,14 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=2,max=4"])
-            .args(&["--memory", "size=512M,hotplug_size=8192M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=2,max=4"])
+            .args(["--memory", "size=512M,hotplug_size=8192M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&["--balloon", "size=0"])
-            .args(&["--api-socket", &api_socket])
+            .args(["--balloon", "size=0"])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -4600,16 +4677,16 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=2,max=4"])
-            .args(&[
+            .args(["--cpus", "boot=2,max=4"])
+            .args([
                 "--memory",
                 "size=512M,hotplug_method=virtio-mem,hotplug_size=8192M",
             ])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&["--api-socket", &api_socket])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -4675,13 +4752,13 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=2,max=4"])
-            .args(&["--memory", "size=512M,hotplug_size=8192M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=2,max=4"])
+            .args(["--memory", "size=512M,hotplug_size=8192M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&["--api-socket", &api_socket])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -4736,13 +4813,13 @@ mod parallel {
         let guest_memory_size_kb = 512 * 1024;
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&[
+            .args(["--cpus", "boot=1"])
+            .args([
                 "--memory",
                 format!("size={}K", guest_memory_size_kb).as_str(),
             ])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .capture_output()
             .spawn()
@@ -4778,11 +4855,11 @@ mod parallel {
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
             .capture_output()
@@ -4923,8 +5000,136 @@ mod parallel {
         handle_child_output(r, &output);
     }
 
+    #[allow(clippy::useless_conversion)]
+    fn create_loop_device(backing_file_path: &str, block_size: u32, num_retries: usize) -> String {
+        const LOOP_CONFIGURE: u64 = 0x4c0a;
+        const LOOP_CTL_GET_FREE: u64 = 0x4c82;
+        const LOOP_CTL_PATH: &str = "/dev/loop-control";
+        const LOOP_DEVICE_PREFIX: &str = "/dev/loop";
+
+        #[repr(C)]
+        struct LoopInfo64 {
+            lo_device: u64,
+            lo_inode: u64,
+            lo_rdevice: u64,
+            lo_offset: u64,
+            lo_sizelimit: u64,
+            lo_number: u32,
+            lo_encrypt_type: u32,
+            lo_encrypt_key_size: u32,
+            lo_flags: u32,
+            lo_file_name: [u8; 64],
+            lo_crypt_name: [u8; 64],
+            lo_encrypt_key: [u8; 32],
+            lo_init: [u64; 2],
+        }
+
+        impl Default for LoopInfo64 {
+            fn default() -> Self {
+                LoopInfo64 {
+                    lo_device: 0,
+                    lo_inode: 0,
+                    lo_rdevice: 0,
+                    lo_offset: 0,
+                    lo_sizelimit: 0,
+                    lo_number: 0,
+                    lo_encrypt_type: 0,
+                    lo_encrypt_key_size: 0,
+                    lo_flags: 0,
+                    lo_file_name: [0; 64],
+                    lo_crypt_name: [0; 64],
+                    lo_encrypt_key: [0; 32],
+                    lo_init: [0; 2],
+                }
+            }
+        }
+
+        #[derive(Default)]
+        #[repr(C)]
+        struct LoopConfig {
+            fd: u32,
+            block_size: u32,
+            info: LoopInfo64,
+            _reserved: [u64; 8],
+        }
+
+        // Open loop-control device
+        let loop_ctl_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(LOOP_CTL_PATH)
+            .unwrap();
+
+        // Request a free loop device
+        let loop_device_number = unsafe {
+            libc::ioctl(
+                loop_ctl_file.as_raw_fd(),
+                LOOP_CTL_GET_FREE.try_into().unwrap(),
+            )
+        };
+        if loop_device_number < 0 {
+            panic!("Couldn't find a free loop device");
+        }
+
+        // Create loop device path
+        let loop_device_path = format!("{}{}", LOOP_DEVICE_PREFIX, loop_device_number);
+
+        // Open loop device
+        let loop_device_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&loop_device_path)
+            .unwrap();
+
+        // Open backing file
+        let backing_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(backing_file_path)
+            .unwrap();
+
+        let loop_config = LoopConfig {
+            fd: backing_file.as_raw_fd() as u32,
+            block_size,
+            ..Default::default()
+        };
+
+        for i in 0..num_retries {
+            let ret = unsafe {
+                libc::ioctl(
+                    loop_device_file.as_raw_fd(),
+                    LOOP_CONFIGURE.try_into().unwrap(),
+                    &loop_config,
+                )
+            };
+            if ret != 0 {
+                if i < num_retries - 1 {
+                    println!(
+                        "Iteration {}: Failed to configure the loop device {}: {}",
+                        i,
+                        loop_device_path,
+                        std::io::Error::last_os_error()
+                    );
+                } else {
+                    panic!(
+                        "Failed {} times trying to configure the loop device {}: {}",
+                        num_retries,
+                        loop_device_path,
+                        std::io::Error::last_os_error()
+                    );
+                }
+            } else {
+                break;
+            }
+
+            // Wait for a bit before retrying
+            thread::sleep(std::time::Duration::new(5, 0));
+        }
+
+        loop_device_path
+    }
+
     #[test]
-    #[cfg(target_arch = "x86_64")]
     fn test_virtio_block_topology() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
@@ -4932,35 +5137,30 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
         let test_disk_path = guest.tmp_dir.as_path().join("test.img");
 
-        Command::new("qemu-img")
-            .args(&[
-                "create",
-                "-f",
-                "raw",
-                test_disk_path.to_str().unwrap(),
-                "16M",
-            ])
-            .output()
-            .expect("qemu-img command failed");
-        let out = Command::new("losetup")
-            .args(&[
-                "--show",
-                "--find",
-                "--sector-size=4096",
-                test_disk_path.to_str().unwrap(),
-            ])
-            .output()
-            .expect("failed to create loop device")
-            .stdout;
-        let _tmp = String::from_utf8_lossy(&out);
-        let loop_dev = _tmp.trim();
+        let output = exec_host_command_output(
+            format!(
+                "qemu-img create -f raw {} 16M",
+                test_disk_path.to_str().unwrap()
+            )
+            .as_str(),
+        );
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "qemu-img command failed\nstdout\n{}\nstderr\n{}",
+                stdout, stderr
+            );
+        }
+
+        let loop_dev = create_loop_device(test_disk_path.to_str().unwrap(), 4096, 5);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&[
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args([
                 "--disk",
                 format!(
                     "path={}",
@@ -4972,7 +5172,7 @@ mod parallel {
                     guest.disk_config.disk(DiskType::CloudInit).unwrap()
                 )
                 .as_str(),
-                format!("path={}", loop_dev).as_str(),
+                format!("path={}", &loop_dev).as_str(),
             ])
             .default_net()
             .capture_output()
@@ -5020,7 +5220,7 @@ mod parallel {
         handle_child_output(r, &output);
 
         Command::new("losetup")
-            .args(&["-d", loop_dev])
+            .args(["-d", &loop_dev])
             .output()
             .expect("loop device not found");
     }
@@ -5036,12 +5236,12 @@ mod parallel {
 
         //Let's start a 4G guest with balloon occupied 2G memory
         let mut child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&["--balloon", "size=2G,deflate_on_oom=on"])
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--balloon", "size=2G,deflate_on_oom=on"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -5061,12 +5261,14 @@ mod parallel {
             assert!(orig_balloon == 2147483648);
 
             // Two steps to verify if the 'deflate_on_oom' parameter works.
-            // 1st: run a command in guest to eat up memory heavily, which
-            // will consume much more memory than $(total_mem - balloon_size)
-            // to trigger an oom.
+            // 1st: run a command to trigger an OOM in the guest.
             guest
-                .ssh_command("stress --vm 25 --vm-keep --vm-bytes 1G --timeout 20")
+                .ssh_command("echo f | sudo tee /proc/sysrq-trigger")
                 .unwrap();
+
+            // Give some time for the OOM to happen in the guest and be reported
+            // back to the host.
+            thread::sleep(std::time::Duration::new(20, 0));
 
             // 2nd: check balloon_mem's value to verify balloon has been automatically deflated
             let deflated_balloon = balloon_size(&api_socket);
@@ -5091,11 +5293,11 @@ mod parallel {
 
         //Let's start a 4G guest with balloon occupied 2G memory
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(&["--balloon", "size=0,free_page_reporting=on"])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--balloon", "size=0,free_page_reporting=on"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -5174,17 +5376,17 @@ mod parallel {
 
         let mut cmd = GuestCommand::new(&guest);
 
-        cmd.args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        cmd.args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
             .capture_output();
 
         if pci_segment.is_some() {
-            cmd.args(&["--platform", "num_pci_segments=16"]);
+            cmd.args(["--platform", "num_pci_segments=16"]);
         }
 
         let mut child = cmd.spawn().unwrap();
@@ -5312,16 +5514,16 @@ mod parallel {
         // Boot without network
         let mut cmd = GuestCommand::new(&guest);
 
-        cmd.args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        cmd.args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .capture_output();
 
         if pci_segment.is_some() {
-            cmd.args(&["--platform", "num_pci_segments=16"]);
+            cmd.args(["--platform", "num_pci_segments=16"]);
         }
 
         let mut child = cmd.spawn().unwrap();
@@ -5464,9 +5666,9 @@ mod parallel {
 
         kernels.iter().for_each(|k_path| {
             let mut child = GuestCommand::new(&guest)
-                .args(&["--kernel", k_path.to_str().unwrap()])
-                .args(&["--initramfs", initramfs_path.to_str().unwrap()])
-                .args(&["--cmdline", &cmdline])
+                .args(["--kernel", k_path.to_str().unwrap()])
+                .args(["--initramfs", initramfs_path.to_str().unwrap()])
+                .args(["--cmdline", &cmdline])
                 .capture_output()
                 .spawn()
                 .unwrap();
@@ -5512,16 +5714,16 @@ mod parallel {
         let event_path = temp_event_monitor_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &api_socket_source])
-            .args(&["--event-monitor", format!("path={}", event_path).as_str()])
-            .args(&["--cpus", "boot=4"])
-            .args(&[
+            .args(["--api-socket", &api_socket_source])
+            .args(["--event-monitor", format!("path={}", event_path).as_str()])
+            .args(["--cpus", "boot=4"])
+            .args([
                 "--memory",
                 "size=4G,hotplug_method=virtio-mem,hotplug_size=32G",
             ])
-            .args(&["--balloon", "size=0"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&[
+            .args(["--balloon", "size=0"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args([
                 "--disk",
                 format!(
                     "path={}",
@@ -5530,9 +5732,9 @@ mod parallel {
                 .as_str(),
                 cloudinit_params.as_str(),
             ])
-            .args(&["--net", net_params.as_str()])
-            .args(&["--vsock", format!("cid=3,socket={}", socket).as_str()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--net", net_params.as_str()])
+            .args(["--vsock", format!("cid=3,socket={}", socket).as_str()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .capture_output()
             .spawn()
             .unwrap();
@@ -5663,12 +5865,12 @@ mod parallel {
 
         // Restore the VM from the snapshot
         let mut child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &api_socket_restored])
-            .args(&[
+            .args(["--api-socket", &api_socket_restored])
+            .args([
                 "--event-monitor",
                 format!("path={}", event_path_restored).as_str(),
             ])
-            .args(&[
+            .args([
                 "--restore",
                 format!("source_url=file://{}", snapshot_dir).as_str(),
             ])
@@ -5756,13 +5958,13 @@ mod parallel {
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut cmd = GuestCommand::new(&guest);
-        cmd.args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", direct_kernel_boot_path().to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        cmd.args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
-            .args(&["--net", guest.default_net_string().as_str()])
-            .args(&["--api-socket", &api_socket])
+            .args(["--net", guest.default_net_string().as_str()])
+            .args(["--api-socket", &api_socket])
             .capture_output();
 
         let mut child = cmd.spawn().unwrap();
@@ -5795,12 +5997,12 @@ mod parallel {
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut cmd = GuestCommand::new(&guest);
-        cmd.args(&["--cpus", "boot=4"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
+        cmd.args(["--cpus", "boot=4"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
             .default_disks()
-            .args(&["--net", guest.default_net_string().as_str()])
-            .args(&["--api-socket", &api_socket])
+            .args(["--net", guest.default_net_string().as_str()])
+            .args(["--api-socket", &api_socket])
             .capture_output();
 
         let mut child = cmd.spawn().unwrap();
@@ -5846,24 +6048,64 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut cmd = GuestCommand::new(&guest);
-        cmd.args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+        cmd.args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
-            .args(&["--net", guest.default_net_string().as_str()])
-            .args(&["--watchdog"])
-            .args(&["--api-socket", &api_socket])
+            .args(["--net", guest.default_net_string().as_str()])
+            .args(["--watchdog"])
+            .args(["--api-socket", &api_socket])
             .capture_output();
 
         let mut child = cmd.spawn().unwrap();
 
         let r = std::panic::catch_unwind(|| {
             guest.wait_vm_boot(None).unwrap();
-            let mut current_reboot_count = 1;
-            enable_guest_watchdog(&guest, &mut current_reboot_count);
-            check_guest_watchdog_no_reboot(&guest, &current_reboot_count);
-            check_guest_watchdog_one_reboot(&guest, &api_socket, &mut current_reboot_count);
+
+            let mut expected_reboot_count = 1;
+
+            // Enable the watchdog with a 15s timeout
+            enable_guest_watchdog(&guest, 15);
+
+            // Reboot and check that systemd has activated the watchdog
+            guest.ssh_command("sudo reboot").unwrap();
+            guest.wait_vm_boot(None).unwrap();
+            expected_reboot_count += 1;
+            assert_eq!(get_reboot_count(&guest), expected_reboot_count);
+            assert_eq!(
+                guest
+                    .ssh_command("sudo journalctl | grep -c -- \"Watchdog started\"")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                2
+            );
+
+            // Allow some normal time to elapse to check we don't get spurious reboots
+            thread::sleep(std::time::Duration::new(40, 0));
+            // Check no reboot
+            assert_eq!(get_reboot_count(&guest), expected_reboot_count);
+
+            // Trigger a panic (sync first). We need to do this inside a screen with a delay so the SSH command returns.
+            guest.ssh_command("screen -dmS reboot sh -c \"sleep 5; echo s | tee /proc/sysrq-trigger; echo c | sudo tee /proc/sysrq-trigger\"").unwrap();
+            // Allow some time for the watchdog to trigger (max 30s) and reboot to happen
+            guest.wait_vm_boot(Some(50)).unwrap();
+            // Check a reboot is triggerred by the watchdog
+            expected_reboot_count += 1;
+            assert_eq!(get_reboot_count(&guest), expected_reboot_count);
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Now pause the VM and remain offline for 30s
+                assert!(remote_command(&api_socket, "pause", None));
+                thread::sleep(std::time::Duration::new(30, 0));
+                assert!(remote_command(&api_socket, "resume", None));
+
+                // Check no reboot
+                assert_eq!(get_reboot_count(&guest), expected_reboot_count);
+            }
         });
 
         let _ = child.kill();
@@ -5887,18 +6129,19 @@ mod parallel {
             Some(std::net::Ipv4Addr::from_str(&guest.network.host_ip).unwrap()),
             None,
             &mut None,
+            None,
             num_queue_pairs,
             Some(libc::O_RDWR | libc::O_NONBLOCK),
         )
         .unwrap();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", &format!("boot={}", num_queue_pairs)])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", &format!("boot={}", num_queue_pairs)])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
-            .args(&[
+            .args([
                 "--net",
                 &format!(
                     "fd=[{},{}],mac={},num_queues={}",
@@ -6016,12 +6259,12 @@ mod parallel {
 
         let mut guest_command = GuestCommand::new(&guest);
         guest_command
-            .args(&["--cpus", "boot=2"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=2"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
-            .args(&["--api-socket", &api_socket]);
+            .args(["--api-socket", &api_socket]);
 
         let net_params = format!(
             "fd=[{},{}],mac={},num_queues=4",
@@ -6029,7 +6272,7 @@ mod parallel {
         );
 
         if !hotplug {
-            guest_command.args(&["--net", &net_params]);
+            guest_command.args(["--net", &net_params]);
         }
 
         let mut child = guest_command.capture_output().spawn().unwrap();
@@ -6161,8 +6404,8 @@ mod parallel {
         let api_socket_restored = format!("{}.2", temp_api_path(&guest2.tmp_dir));
         // Restore the VM from the snapshot
         let mut child2 = GuestCommand::new(&guest2)
-            .args(&["--api-socket", &api_socket_restored])
-            .args(&[
+            .args(["--api-socket", &api_socket_restored])
+            .args([
                 "--restore",
                 format!("source_url=file://{}", snapshot_dir).as_str(),
             ])
@@ -6196,13 +6439,13 @@ mod parallel {
             guest2.ssh_command("nc -vz 172.100.0.1 12345").unwrap();
         });
 
-        cleanup_ovs_dpdk();
-
         let _ = child1.kill();
         let _ = child2.kill();
 
         let output = child1.wait_with_output().unwrap();
         child2.wait().unwrap();
+
+        cleanup_ovs_dpdk();
 
         handle_child_output(r, &output);
     }
@@ -6228,7 +6471,7 @@ mod parallel {
 
         // Start the SPDK nvmf_tgt daemon to present NVMe device as a VFIO user device
         Command::new("/usr/local/bin/spdk-nvme/nvmf_tgt")
-            .args(&["-i", "0", "-m", "0x1"])
+            .args(["-i", "0", "-m", "0x1"])
             .spawn()
             .unwrap();
         thread::sleep(std::time::Duration::new(2, 0));
@@ -6272,11 +6515,11 @@ mod parallel {
 
         let api_socket = temp_api_path(&guest.tmp_dir);
         let mut child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M,shared=on,hugepages=on"])
-            .args(&["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
-            .args(&["--serial", "tty", "--console", "off"])
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M,shared=on,hugepages=on"])
+            .args(["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
+            .args(["--serial", "tty", "--console", "off"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -6362,15 +6605,15 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=2"])
-            .args(&["--memory", "size=512M,hugepages=on"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=2"])
+            .args(["--memory", "size=512M,hugepages=on"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&["--vdpa", "path=/dev/vhost-vdpa-0,num_queues=1"])
-            .args(&["--platform", "num_pci_segments=2,iommu_segments=1"])
-            .args(&["--api-socket", &api_socket])
+            .args(["--vdpa", "path=/dev/vhost-vdpa-0,num_queues=1"])
+            .args(["--platform", "num_pci_segments=2,iommu_segments=1"])
+            .args(["--api-socket", &api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -6483,13 +6726,13 @@ mod parallel {
         let kernel_path = direct_kernel_boot_path();
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=2"])
-            .args(&["--memory", "size=512M,hugepages=on"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=2"])
+            .args(["--memory", "size=512M,hugepages=on"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&["--vdpa", "path=/dev/vhost-vdpa-2,num_queues=2"])
+            .args(["--vdpa", "path=/dev/vhost-vdpa-2,num_queues=2"])
             .capture_output()
             .spawn()
             .unwrap();
@@ -6549,7 +6792,7 @@ mod parallel {
     }
 }
 
-mod sequential {
+mod common_sequential {
     use crate::*;
 
     #[test]
@@ -6558,7 +6801,6 @@ mod sequential {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 mod windows {
     use crate::*;
     use once_cell::sync::Lazy;
@@ -6677,7 +6919,7 @@ mod windows {
 
             // Create an image file
             let out = Command::new("qemu-img")
-                .args(&[
+                .args([
                     "create",
                     "-f",
                     "raw",
@@ -6691,7 +6933,7 @@ mod windows {
 
             // Associate image to a loop device
             let out = Command::new("losetup")
-                .args(&["--show", "-f", img.to_str().unwrap()])
+                .args(["--show", "-f", img.to_str().unwrap()])
                 .output()
                 .expect("failed to create loop device")
                 .stdout;
@@ -6702,7 +6944,7 @@ mod windows {
             // Create a partition table
             // echo 'type=7' | sudo sfdisk "${LOOP}"
             let mut child = Command::new("sfdisk")
-                .args(&[loop_dev])
+                .args([loop_dev])
                 .stdin(Stdio::piped())
                 .spawn()
                 .unwrap();
@@ -6715,7 +6957,7 @@ mod windows {
 
             // Disengage the loop device
             let out = Command::new("losetup")
-                .args(&["-d", loop_dev])
+                .args(["-d", loop_dev])
                 .output()
                 .expect("loop device not found")
                 .stdout;
@@ -6723,7 +6965,7 @@ mod windows {
 
             // Re-associate loop device pointing to the partition only
             let out = Command::new("losetup")
-                .args(&[
+                .args([
                     "--show",
                     "--offset",
                     (512 * 2048).to_string().as_str(),
@@ -6744,7 +6986,7 @@ mod windows {
                 _ => panic!("Unknown filesystem type '{}'", fs),
             };
             let out = Command::new(fs_cmd)
-                .args(&[&loop_dev])
+                .args([&loop_dev])
                 .output()
                 .unwrap_or_else(|_| panic!("{} failed", fs_cmd))
                 .stdout;
@@ -6752,7 +6994,7 @@ mod windows {
 
             // Disengage the loop device
             let out = Command::new("losetup")
-                .args(&["-d", loop_dev])
+                .args(["-d", loop_dev])
                 .output()
                 .unwrap_or_else(|_| panic!("loop device '{}' not found", loop_dev))
                 .stdout;
@@ -6820,7 +7062,7 @@ mod windows {
     fn vcpu_threads_count(pid: u32) -> u8 {
         // ps -T -p 12345 | grep vcpu | wc -l
         let out = Command::new("ps")
-            .args(&["-T", "-p", format!("{}", pid).as_str()])
+            .args(["-T", "-p", format!("{}", pid).as_str()])
             .output()
             .expect("ps command failed")
             .stdout;
@@ -6830,7 +7072,7 @@ mod windows {
     fn netdev_ctrl_threads_count(pid: u32) -> u8 {
         // ps -T -p 12345 | grep "_net[0-9]*_ctrl" | wc -l
         let out = Command::new("ps")
-            .args(&["-T", "-p", format!("{}", pid).as_str()])
+            .args(["-T", "-p", format!("{}", pid).as_str()])
             .output()
             .expect("ps command failed")
             .stdout;
@@ -6844,7 +7086,7 @@ mod windows {
     fn disk_ctrl_threads_count(pid: u32) -> u8 {
         // ps -T -p 15782  | grep "_disk[0-9]*_q0" | wc -l
         let out = Command::new("ps")
-            .args(&["-T", "-p", format!("{}", pid).as_str()])
+            .args(["-T", "-p", format!("{}", pid).as_str()])
             .output()
             .expect("ps command failed")
             .stdout;
@@ -6859,16 +7101,12 @@ mod windows {
     fn test_windows_guest() {
         let windows_guest = WindowsGuest::new();
 
-        let mut ovmf_path = dirs::home_dir().unwrap();
-        ovmf_path.push("workloads");
-        ovmf_path.push(OVMF_NAME);
-
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--cpus", "boot=2,kvm_hyperv=on"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", ovmf_path.to_str().unwrap()])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+            .args(["--cpus", "boot=2,kvm_hyperv=on"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", edk2_path().to_str().unwrap()])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -6910,12 +7148,12 @@ mod windows {
         ovmf_path.push(OVMF_NAME);
 
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--cpus", "boot=4,kvm_hyperv=on"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", ovmf_path.to_str().unwrap()])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
-            .args(&[
+            .args(["--cpus", "boot=4,kvm_hyperv=on"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", ovmf_path.to_str().unwrap()])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
+            .args([
                 "--disk",
                 format!(
                     "path={},num_queues=4",
@@ -6927,7 +7165,7 @@ mod windows {
                 )
                 .as_str(),
             ])
-            .args(&[
+            .args([
                 "--net",
                 format!(
                     "tap=,mac={},ip={},mask=255.255.255.0,num_queues=8",
@@ -6968,6 +7206,7 @@ mod windows {
 
     #[test]
     #[cfg(not(feature = "mshv"))]
+    #[ignore = "See #4327"]
     fn test_windows_guest_snapshot_restore() {
         let windows_guest = WindowsGuest::new();
 
@@ -6979,12 +7218,12 @@ mod windows {
         let api_socket_source = format!("{}.1", temp_api_path(&tmp_dir));
 
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--api-socket", &api_socket_source])
-            .args(&["--cpus", "boot=2,kvm_hyperv=on"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", ovmf_path.to_str().unwrap()])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+            .args(["--api-socket", &api_socket_source])
+            .args(["--cpus", "boot=2,kvm_hyperv=on"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", ovmf_path.to_str().unwrap()])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7025,8 +7264,8 @@ mod windows {
 
         // Restore the VM from the snapshot
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--api-socket", &api_socket_restored])
-            .args(&[
+            .args(["--api-socket", &api_socket_restored])
+            .args([
                 "--restore",
                 format!("source_url=file://{}", snapshot_dir).as_str(),
             ])
@@ -7056,6 +7295,7 @@ mod windows {
 
     #[test]
     #[cfg(not(feature = "mshv"))]
+    #[cfg(not(target_arch = "aarch64"))]
     fn test_windows_guest_cpu_hotplug() {
         let windows_guest = WindowsGuest::new();
 
@@ -7067,12 +7307,12 @@ mod windows {
         let api_socket = temp_api_path(&tmp_dir);
 
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=2,max=8,kvm_hyperv=on"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", ovmf_path.to_str().unwrap()])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=2,max=8,kvm_hyperv=on"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", ovmf_path.to_str().unwrap()])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7130,6 +7370,7 @@ mod windows {
 
     #[test]
     #[cfg(not(feature = "mshv"))]
+    #[cfg(not(target_arch = "aarch64"))]
     fn test_windows_guest_ram_hotplug() {
         let windows_guest = WindowsGuest::new();
 
@@ -7141,12 +7382,12 @@ mod windows {
         let api_socket = temp_api_path(&tmp_dir);
 
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=2,kvm_hyperv=on"])
-            .args(&["--memory", "size=2G,hotplug_size=5G"])
-            .args(&["--kernel", ovmf_path.to_str().unwrap()])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=2,kvm_hyperv=on"])
+            .args(["--memory", "size=2G,hotplug_size=5G"])
+            .args(["--kernel", ovmf_path.to_str().unwrap()])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7215,12 +7456,12 @@ mod windows {
         let api_socket = temp_api_path(&tmp_dir);
 
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=2,kvm_hyperv=on"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", ovmf_path.to_str().unwrap()])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=2,kvm_hyperv=on"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", ovmf_path.to_str().unwrap()])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7276,6 +7517,7 @@ mod windows {
 
     #[test]
     #[cfg(not(feature = "mshv"))]
+    #[cfg(not(target_arch = "aarch64"))]
     fn test_windows_guest_disk_hotplug() {
         let windows_guest = WindowsGuest::new();
 
@@ -7287,12 +7529,12 @@ mod windows {
         let api_socket = temp_api_path(&tmp_dir);
 
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=2,kvm_hyperv=on"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", ovmf_path.to_str().unwrap()])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=2,kvm_hyperv=on"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", ovmf_path.to_str().unwrap()])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7370,6 +7612,7 @@ mod windows {
 
     #[test]
     #[cfg(not(feature = "mshv"))]
+    #[cfg(not(target_arch = "aarch64"))]
     fn test_windows_guest_disk_hotplug_multi() {
         let windows_guest = WindowsGuest::new();
 
@@ -7381,12 +7624,12 @@ mod windows {
         let api_socket = temp_api_path(&tmp_dir);
 
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=2,kvm_hyperv=on"])
-            .args(&["--memory", "size=2G"])
-            .args(&["--kernel", ovmf_path.to_str().unwrap()])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=2,kvm_hyperv=on"])
+            .args(["--memory", "size=2G"])
+            .args(["--kernel", ovmf_path.to_str().unwrap()])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7499,6 +7742,7 @@ mod windows {
 
     #[test]
     #[cfg(not(feature = "mshv"))]
+    #[cfg(not(target_arch = "aarch64"))]
     fn test_windows_guest_netdev_multi() {
         let windows_guest = WindowsGuest::new();
 
@@ -7510,15 +7754,15 @@ mod windows {
         let api_socket = temp_api_path(&tmp_dir);
 
         let mut child = GuestCommand::new(windows_guest.guest())
-            .args(&["--api-socket", &api_socket])
-            .args(&["--cpus", "boot=2,kvm_hyperv=on"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", ovmf_path.to_str().unwrap()])
-            .args(&["--serial", "tty"])
-            .args(&["--console", "off"])
+            .args(["--api-socket", &api_socket])
+            .args(["--cpus", "boot=2,kvm_hyperv=on"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", ovmf_path.to_str().unwrap()])
+            .args(["--serial", "tty"])
+            .args(["--console", "off"])
             .default_disks()
             // The multi net dev config is borrowed from test_multiple_network_interfaces
-            .args(&[
+            .args([
                 "--net",
                 windows_guest.guest().default_net_string().as_str(),
                 "tap=,mac=8a:6b:6f:5a:de:ac,ip=192.168.3.1,mask=255.255.255.0",
@@ -7570,13 +7814,13 @@ mod sgx {
         kernel_path.push("vmlinux_w_sgx");
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=1"])
-            .args(&["--memory", "size=512M"])
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
             .default_net()
-            .args(&["--sgx-epc", "id=epc0,size=64M"])
+            .args(["--sgx-epc", "id=epc0,size=64M"])
             .capture_output()
             .spawn()
             .unwrap();
@@ -7620,20 +7864,283 @@ mod sgx {
 mod vfio {
     use crate::*;
 
+    #[test]
+    // The VFIO integration test starts cloud-hypervisor guest with 3 TAP
+    // backed networking interfaces, bound through a simple bridge on the host.
+    // So if the nested cloud-hypervisor succeeds in getting a directly
+    // assigned interface from its cloud-hypervisor host, we should be able to
+    // ssh into it, and verify that it's running with the right kernel command
+    // line (We tag the command line from cloud-hypervisor for that purpose).
+    // The third device is added to validate that hotplug works correctly since
+    // it is being added to the L2 VM through hotplugging mechanism.
+    // Also, we pass-through a vitio-blk device to the L2 VM to test the 32-bit
+    // vfio device support
+    fn test_vfio() {
+        setup_vfio_network_interfaces();
+
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new_from_ip_range(Box::new(focal), "172.18", 0);
+
+        let mut workload_path = dirs::home_dir().unwrap();
+        workload_path.push("workloads");
+
+        let kernel_path = direct_kernel_boot_path();
+
+        let mut vfio_path = workload_path.clone();
+        vfio_path.push("vfio");
+
+        let mut cloud_init_vfio_base_path = vfio_path.clone();
+        cloud_init_vfio_base_path.push("cloudinit.img");
+
+        // We copy our cloudinit into the vfio mount point, for the nested
+        // cloud-hypervisor guest to use.
+        rate_limited_copy(
+            &guest.disk_config.disk(DiskType::CloudInit).unwrap(),
+            &cloud_init_vfio_base_path,
+        )
+        .expect("copying of cloud-init disk failed");
+
+        let mut vfio_disk_path = workload_path.clone();
+        vfio_disk_path.push("vfio.img");
+
+        // Create the vfio disk image
+        let output = Command::new("mkfs.ext4")
+            .arg("-d")
+            .arg(vfio_path.to_str().unwrap())
+            .arg(vfio_disk_path.to_str().unwrap())
+            .arg("2g")
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+            panic!("mkfs.ext4 command generated an error");
+        }
+
+        let mut blk_file_path = workload_path;
+        blk_file_path.push("blk.img");
+
+        let vfio_tap0 = "vfio-tap0";
+        let vfio_tap1 = "vfio-tap1";
+        let vfio_tap2 = "vfio-tap2";
+        let vfio_tap3 = "vfio-tap3";
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=4"])
+            .args(["--memory", "size=2G,hugepages=on,shared=on"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args([
+                "--disk",
+                format!(
+                    "path={}",
+                    guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
+                )
+                .as_str(),
+                format!(
+                    "path={}",
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap()
+                )
+                .as_str(),
+                format!("path={}", vfio_disk_path.to_str().unwrap()).as_str(),
+                format!("path={},iommu=on", blk_file_path.to_str().unwrap()).as_str(),
+            ])
+            .args([
+                "--cmdline",
+                format!(
+                    "{} kvm-intel.nested=1 vfio_iommu_type1.allow_unsafe_interrupts",
+                    DIRECT_KERNEL_BOOT_CMDLINE
+                )
+                .as_str(),
+            ])
+            .args([
+                "--net",
+                format!("tap={},mac={}", vfio_tap0, guest.network.guest_mac).as_str(),
+                format!(
+                    "tap={},mac={},iommu=on",
+                    vfio_tap1, guest.network.l2_guest_mac1
+                )
+                .as_str(),
+                format!(
+                    "tap={},mac={},iommu=on",
+                    vfio_tap2, guest.network.l2_guest_mac2
+                )
+                .as_str(),
+                format!(
+                    "tap={},mac={},iommu=on",
+                    vfio_tap3, guest.network.l2_guest_mac3
+                )
+                .as_str(),
+            ])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        thread::sleep(std::time::Duration::new(30, 0));
+
+        let r = std::panic::catch_unwind(|| {
+            guest.ssh_command_l1("sudo systemctl start vfio").unwrap();
+            thread::sleep(std::time::Duration::new(120, 0));
+
+            // We booted our cloud hypervisor L2 guest with a "VFIOTAG" tag
+            // added to its kernel command line.
+            // Let's ssh into it and verify that it's there. If it is it means
+            // we're in the right guest (The L2 one) because the QEMU L1 guest
+            // does not have this command line tag.
+            assert_eq!(
+                guest
+                    .ssh_command_l2_1("grep -c VFIOTAG /proc/cmdline")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            // Let's also verify from the second virtio-net device passed to
+            // the L2 VM.
+            assert_eq!(
+                guest
+                    .ssh_command_l2_2("grep -c VFIOTAG /proc/cmdline")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            // Check the amount of PCI devices appearing in L2 VM.
+            assert_eq!(
+                guest
+                    .ssh_command_l2_1("ls /sys/bus/pci/devices | wc -l")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                8,
+            );
+
+            // Check both if /dev/vdc exists and if the block size is 16M in L2 VM
+            assert_eq!(
+                guest
+                    .ssh_command_l2_1("lsblk | grep vdc | grep -c 16M")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            // Hotplug an extra virtio-net device through L2 VM.
+            guest
+                .ssh_command_l1(
+                    "echo 0000:00:09.0 | sudo tee /sys/bus/pci/devices/0000:00:09.0/driver/unbind",
+                )
+                .unwrap();
+            guest
+                .ssh_command_l1("echo 0000:00:09.0 | sudo tee /sys/bus/pci/drivers/vfio-pci/bind")
+                .unwrap();
+            let vfio_hotplug_output = guest
+                .ssh_command_l1(
+                    "sudo /mnt/ch-remote \
+                 --api-socket=/tmp/ch_api.sock \
+                 add-device path=/sys/bus/pci/devices/0000:00:09.0,id=vfio123",
+                )
+                .unwrap();
+            assert!(vfio_hotplug_output.contains("{\"id\":\"vfio123\",\"bdf\":\"0000:00:08.0\"}"));
+
+            thread::sleep(std::time::Duration::new(10, 0));
+
+            // Let's also verify from the third virtio-net device passed to
+            // the L2 VM. This third device has been hotplugged through the L2
+            // VM, so this is our way to validate hotplug works for VFIO PCI.
+            assert_eq!(
+                guest
+                    .ssh_command_l2_3("grep -c VFIOTAG /proc/cmdline")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                1
+            );
+
+            // Check the amount of PCI devices appearing in L2 VM.
+            // There should be one more device than before, raising the count
+            // up to 9 PCI devices.
+            assert_eq!(
+                guest
+                    .ssh_command_l2_1("ls /sys/bus/pci/devices | wc -l")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                9,
+            );
+
+            // Let's now verify that we can correctly remove the virtio-net
+            // device through the "remove-device" command responsible for
+            // unplugging VFIO devices.
+            guest
+                .ssh_command_l1(
+                    "sudo /mnt/ch-remote \
+                 --api-socket=/tmp/ch_api.sock \
+                 remove-device vfio123",
+                )
+                .unwrap();
+            thread::sleep(std::time::Duration::new(10, 0));
+
+            // Check the amount of PCI devices appearing in L2 VM is back down
+            // to 8 devices.
+            assert_eq!(
+                guest
+                    .ssh_command_l2_1("ls /sys/bus/pci/devices | wc -l")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                8,
+            );
+
+            // Perform memory hotplug in L2 and validate the memory is showing
+            // up as expected. In order to check, we will use the virtio-net
+            // device already passed through L2 as a VFIO device, this will
+            // verify that VFIO devices are functional with memory hotplug.
+            assert!(guest.get_total_memory_l2().unwrap_or_default() > 480_000);
+            guest
+                .ssh_command_l2_1(
+                    "sudo bash -c 'echo online > /sys/devices/system/memory/auto_online_blocks'",
+                )
+                .unwrap();
+            guest
+                .ssh_command_l1(
+                    "sudo /mnt/ch-remote \
+                 --api-socket=/tmp/ch_api.sock \
+                 resize --memory=1073741824",
+                )
+                .unwrap();
+            assert!(guest.get_total_memory_l2().unwrap_or_default() > 960_000);
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        cleanup_vfio_network_interfaces();
+
+        handle_child_output(r, &output);
+    }
+
     fn test_nvidia_card_memory_hotplug(hotplug_method: &str) {
         let hirsute = UbuntuDiskConfig::new(HIRSUTE_NVIDIA_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(hirsute));
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=4"])
-            .args(&[
+            .args(["--cpus", "boot=4"])
+            .args([
                 "--memory",
                 format!("size=4G,hotplug_size=4G,hotplug_method={}", hotplug_method).as_str(),
             ])
-            .args(&["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
-            .args(&["--device", "path=/sys/bus/pci/devices/0000:31:00.0/"])
-            .args(&["--api-socket", &api_socket])
+            .args(["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
+            .args(["--device", "path=/sys/bus/pci/devices/0000:31:00.0/"])
+            .args(["--api-socket", &api_socket])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7680,10 +8187,10 @@ mod vfio {
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=4"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
-            .args(&["--api-socket", &api_socket])
+            .args(["--cpus", "boot=4"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
+            .args(["--api-socket", &api_socket])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7722,11 +8229,11 @@ mod vfio {
         let api_socket = temp_api_path(&guest.tmp_dir);
 
         let mut child = GuestCommand::new(&guest)
-            .args(&["--cpus", "boot=4"])
-            .args(&["--memory", "size=4G"])
-            .args(&["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
-            .args(&["--device", "path=/sys/bus/pci/devices/0000:31:00.0/"])
-            .args(&["--api-socket", &api_socket])
+            .args(["--cpus", "boot=4"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
+            .args(["--device", "path=/sys/bus/pci/devices/0000:31:00.0/"])
+            .args(["--api-socket", &api_socket])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7755,6 +8262,126 @@ mod vfio {
 mod live_migration {
     use crate::*;
 
+    fn start_live_migration(
+        migration_socket: &str,
+        src_api_socket: &str,
+        dest_api_socket: &str,
+        local: bool,
+    ) -> bool {
+        // Start to receive migration from the destintion VM
+        let mut receive_migration = Command::new(clh_command("ch-remote"))
+            .args([
+                &format!("--api-socket={}", dest_api_socket),
+                "receive-migration",
+                &format! {"unix:{}", migration_socket},
+            ])
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Give it '1s' to make sure the 'migration_socket' file is properly created
+        thread::sleep(std::time::Duration::new(1, 0));
+        // Start to send migration from the source VM
+
+        let mut args = [
+            format!("--api-socket={}", &src_api_socket),
+            "send-migration".to_string(),
+            format! {"unix:{}", migration_socket},
+        ]
+        .to_vec();
+
+        if local {
+            args.insert(2, "--local".to_string());
+        }
+
+        let mut send_migration = Command::new(clh_command("ch-remote"))
+            .args(&args)
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // The 'send-migration' command should be executed successfully within the given timeout
+        let send_success = if let Some(status) = send_migration
+            .wait_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+        {
+            status.success()
+        } else {
+            false
+        };
+
+        if !send_success {
+            let _ = send_migration.kill();
+            let output = send_migration.wait_with_output().unwrap();
+            eprintln!("\n\n==== Start 'send_migration' output ====\n\n---stdout---\n{}\n\n---stderr---\n{}\n\n==== End 'send_migration' output ====\n\n",
+                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+
+        // The 'receive-migration' command should be executed successfully within the given timeout
+        let receive_success = if let Some(status) = receive_migration
+            .wait_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+        {
+            status.success()
+        } else {
+            false
+        };
+
+        if !receive_success {
+            let _ = receive_migration.kill();
+            let output = receive_migration.wait_with_output().unwrap();
+            eprintln!("\n\n==== Start 'receive_migration' output ====\n\n---stdout---\n{}\n\n---stderr---\n{}\n\n==== End 'receive_migration' output ====\n\n",
+                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
+
+        send_success && receive_success
+    }
+
+    fn print_and_panic(src_vm: Child, dest_vm: Child, ovs_vm: Option<Child>, message: &str) -> ! {
+        let mut src_vm = src_vm;
+        let mut dest_vm = dest_vm;
+
+        let _ = src_vm.kill();
+        let src_output = src_vm.wait_with_output().unwrap();
+        eprintln!(
+            "\n\n==== Start 'source_vm' stdout ====\n\n{}\n\n==== End 'source_vm' stdout ====",
+            String::from_utf8_lossy(&src_output.stdout)
+        );
+        eprintln!(
+            "\n\n==== Start 'source_vm' stderr ====\n\n{}\n\n==== End 'source_vm' stderr ====",
+            String::from_utf8_lossy(&src_output.stderr)
+        );
+        let _ = dest_vm.kill();
+        let dest_output = dest_vm.wait_with_output().unwrap();
+        eprintln!(
+                "\n\n==== Start 'destination_vm' stdout ====\n\n{}\n\n==== End 'destination_vm' stdout ====",
+                String::from_utf8_lossy(&dest_output.stdout)
+            );
+        eprintln!(
+                "\n\n==== Start 'destination_vm' stderr ====\n\n{}\n\n==== End 'destination_vm' stderr ====",
+                String::from_utf8_lossy(&dest_output.stderr)
+            );
+
+        if let Some(ovs_vm) = ovs_vm {
+            let mut ovs_vm = ovs_vm;
+            let _ = ovs_vm.kill();
+            let ovs_output = ovs_vm.wait_with_output().unwrap();
+            eprintln!(
+                "\n\n==== Start 'ovs_vm' stdout ====\n\n{}\n\n==== End 'ovs_vm' stdout ====",
+                String::from_utf8_lossy(&ovs_output.stdout)
+            );
+            eprintln!(
+                "\n\n==== Start 'ovs_vm' stderr ====\n\n{}\n\n==== End 'ovs_vm' stderr ====",
+                String::from_utf8_lossy(&ovs_output.stderr)
+            );
+
+            cleanup_ovs_dpdk();
+        }
+
+        panic!("Test failed: {}", message)
+    }
+
     // This test exercises the local live-migration between two Cloud Hypervisor VMs on the
     // same host. It ensures the following behaviors:
     // 1. The source VM is up and functional (including various virtio-devices are working properly);
@@ -7763,18 +8390,7 @@ mod live_migration {
     // 4. The destination VM is functional (including various virtio-devices are working properly) after
     //    live migration;
     // Note: This test does not use vsock as we can't create two identical vsock on the same host.
-    fn _test_live_migration(
-        upgrade_test: bool,
-        numa: bool,
-        local: bool,
-        watchdog: bool,
-        balloon: bool,
-    ) {
-        assert!(
-            !(numa && balloon),
-            "Invalid inputs: 'numa' and 'balloon' cannot be tested at the same time."
-        );
-
+    fn _test_live_migration(upgrade_test: bool, local: bool) {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
         let kernel_path = direct_kernel_boot_path();
@@ -7785,46 +8401,14 @@ mod live_migration {
             net_id, guest.network.guest_mac, guest.network.host_ip
         );
 
-        let memory_param: &[&str] = match (balloon, local, numa) {
-            (false, false, false) => &["--memory", "size=4G"],
-            (false, false, true) => &[
-                "--memory",
-                "size=0,hotplug_method=virtio-mem",
-                "--memory-zone",
-                "id=mem0,size=1G,hotplug_size=4G",
-                "id=mem1,size=1G,hotplug_size=4G",
-                "id=mem2,size=2G,hotplug_size=4G",
-                "--numa",
-                "guest_numa_id=0,cpus=[0-2,9],distances=[1@15,2@20],memory_zones=mem0",
-                "guest_numa_id=1,cpus=[3-4,6-8],distances=[0@20,2@25],memory_zones=mem1",
-                "guest_numa_id=2,cpus=[5,10-11],distances=[0@25,1@30],memory_zones=mem2",
-            ],
-            (false, true, false) => &["--memory", "size=4G,shared=on"],
-            (false, true, true) => &[
-                "--memory",
-                "size=0,hotplug_method=virtio-mem,shared=on",
-                "--memory-zone",
-                "id=mem0,size=1G,hotplug_size=4G,shared=on",
-                "id=mem1,size=1G,hotplug_size=4G,shared=on",
-                "id=mem2,size=2G,hotplug_size=4G,shared=on",
-                "--numa",
-                "guest_numa_id=0,cpus=[0-2,9],distances=[1@15,2@20],memory_zones=mem0",
-                "guest_numa_id=1,cpus=[3-4,6-8],distances=[0@20,2@25],memory_zones=mem1",
-                "guest_numa_id=2,cpus=[5,10-11],distances=[0@25,1@30],memory_zones=mem2",
-            ],
-            (true, false, _) => &[
-                "--memory",
-                "size=4G,hotplug_method=virtio-mem,hotplug_size=8G",
-                "--balloon",
-                "size=0",
-            ],
-            (true, true, _) => &[
-                "--memory",
-                "size=4G,hotplug_method=virtio-mem,hotplug_size=8G,shared=on",
-                "--balloon",
-                "size=0",
-            ],
+        let memory_param: &[&str] = if local {
+            &["--memory", "size=4G,shared=on"]
+        } else {
+            &["--memory", "size=4G"]
         };
+
+        let boot_vcpus = 2;
+        let max_vcpus = 4;
 
         let pmem_temp_file = TempFile::new().unwrap();
         pmem_temp_file.as_file().set_len(128 << 20).unwrap();
@@ -7843,27 +8427,27 @@ mod live_migration {
         let src_api_socket = temp_api_path(&guest.tmp_dir);
         let mut src_vm_cmd = GuestCommand::new_with_binary_path(&guest, &src_vm_path);
         src_vm_cmd
-            .args(&["--cpus", "boot=6,max=12"])
+            .args([
+                "--cpus",
+                format!("boot={},max={}", boot_vcpus, max_vcpus).as_str(),
+            ])
             .args(memory_param)
-            .args(&["--kernel", kernel_path.to_str().unwrap()])
-            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
             .default_disks()
-            .args(&["--net", net_params.as_str()])
-            .args(&["--api-socket", &src_api_socket])
-            .args(&[
+            .args(["--net", net_params.as_str()])
+            .args(["--api-socket", &src_api_socket])
+            .args([
                 "--pmem",
                 format!("file={}", pmem_temp_file.as_path().to_str().unwrap(),).as_str(),
             ]);
-        if watchdog {
-            src_vm_cmd.args(&["--watchdog"]);
-        }
         let mut src_child = src_vm_cmd.capture_output().spawn().unwrap();
 
         // Start the destination VM
         let mut dest_api_socket = temp_api_path(&guest.tmp_dir);
         dest_api_socket.push_str(".dest");
         let mut dest_child = GuestCommand::new(&guest)
-            .args(&["--api-socket", &dest_api_socket])
+            .args(["--api-socket", &dest_api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -7873,26 +8457,375 @@ mod live_migration {
 
             // Make sure the source VM is functaionl
             // Check the number of vCPUs
-            assert_eq!(guest.get_cpu_count().unwrap_or_default(), 6);
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
 
             // Check the guest RAM
-            if balloon {
-                assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
-                // Increase the guest RAM
-                resize_command(&src_api_socket, None, Some(6 << 30), None, None);
-                thread::sleep(std::time::Duration::new(5, 0));
-                assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
-                // Use balloon to remove RAM from the VM
-                resize_command(&src_api_socket, None, None, Some(1 << 30), None);
-                thread::sleep(std::time::Duration::new(5, 0));
-                let total_memory = guest.get_total_memory().unwrap_or_default();
-                assert!(total_memory > 4_800_000);
-                assert!(total_memory < 5_760_000);
-            } else if numa {
-                assert!(guest.get_total_memory().unwrap_or_default() > 2_880_000);
-            } else {
-                assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
+            assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
+
+            // Check the guest virtio-devices, e.g. block, rng, console, and net
+            guest.check_devices_common(None, Some(&console_text), Some(&pmem_path));
+
+            // x86_64: Following what's done in the `test_snapshot_restore`, we need
+            // to make sure that removing and adding back the virtio-net device does
+            // not break the live-migration support for virtio-pci.
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert!(remote_command(
+                    &src_api_socket,
+                    "remove-device",
+                    Some(net_id),
+                ));
+                thread::sleep(std::time::Duration::new(10, 0));
+
+                // Plug the virtio-net device again
+                assert!(remote_command(
+                    &src_api_socket,
+                    "add-net",
+                    Some(net_params.as_str()),
+                ));
+                thread::sleep(std::time::Duration::new(10, 0));
             }
+
+            // Start the live-migration
+            let migration_socket = String::from(
+                guest
+                    .tmp_dir
+                    .as_path()
+                    .join("live-migration.sock")
+                    .to_str()
+                    .unwrap(),
+            );
+
+            assert!(
+                start_live_migration(&migration_socket, &src_api_socket, &dest_api_socket, local),
+                "Unsuccessful command: 'send-migration' or 'receive-migration'."
+            );
+        });
+
+        // Check and report any errors occured during the live-migration
+        if r.is_err() {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occured during live-migration",
+            );
+        }
+
+        // Check the source vm has been terminated successful (give it '3s' to settle)
+        thread::sleep(std::time::Duration::new(3, 0));
+        if !src_child.try_wait().unwrap().map_or(false, |s| s.success()) {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "source VM was not terminated successfully.",
+            );
+        };
+
+        // Post live-migration check to make sure the destination VM is funcational
+        let r = std::panic::catch_unwind(|| {
+            // Perform same checks to validate VM has been properly migrated
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
+            assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
+
+            guest.check_devices_common(None, Some(&console_text), Some(&pmem_path));
+        });
+
+        // Clean-up the destination VM and make sure it terminated correctly
+        let _ = dest_child.kill();
+        let dest_output = dest_child.wait_with_output().unwrap();
+        handle_child_output(r, &dest_output);
+
+        // Check the destination VM has the expected 'concole_text' from its output
+        let r = std::panic::catch_unwind(|| {
+            assert!(String::from_utf8_lossy(&dest_output.stdout).contains(&console_text));
+        });
+        handle_child_output(r, &dest_output);
+    }
+
+    fn _test_live_migration_balloon(upgrade_test: bool, local: bool) {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let kernel_path = direct_kernel_boot_path();
+        let console_text = String::from("On a branch floating down river a cricket, singing.");
+        let net_id = "net123";
+        let net_params = format!(
+            "id={},tap=,mac={},ip={},mask=255.255.255.0",
+            net_id, guest.network.guest_mac, guest.network.host_ip
+        );
+
+        let memory_param: &[&str] = if local {
+            &[
+                "--memory",
+                "size=4G,hotplug_method=virtio-mem,hotplug_size=8G,shared=on",
+                "--balloon",
+                "size=0",
+            ]
+        } else {
+            &[
+                "--memory",
+                "size=4G,hotplug_method=virtio-mem,hotplug_size=8G",
+                "--balloon",
+                "size=0",
+            ]
+        };
+
+        let boot_vcpus = 2;
+        let max_vcpus = 4;
+
+        let pmem_temp_file = TempFile::new().unwrap();
+        pmem_temp_file.as_file().set_len(128 << 20).unwrap();
+        std::process::Command::new("mkfs.ext4")
+            .arg(pmem_temp_file.as_path())
+            .output()
+            .expect("Expect creating disk image to succeed");
+        let pmem_path = String::from("/dev/pmem0");
+
+        // Start the source VM
+        let src_vm_path = if !upgrade_test {
+            clh_command("cloud-hypervisor")
+        } else {
+            cloud_hypervisor_release_path()
+        };
+        let src_api_socket = temp_api_path(&guest.tmp_dir);
+        let mut src_vm_cmd = GuestCommand::new_with_binary_path(&guest, &src_vm_path);
+        src_vm_cmd
+            .args([
+                "--cpus",
+                format!("boot={},max={}", boot_vcpus, max_vcpus).as_str(),
+            ])
+            .args(memory_param)
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .default_disks()
+            .args(["--net", net_params.as_str()])
+            .args(["--api-socket", &src_api_socket])
+            .args([
+                "--pmem",
+                format!("file={}", pmem_temp_file.as_path().to_str().unwrap(),).as_str(),
+            ]);
+        let mut src_child = src_vm_cmd.capture_output().spawn().unwrap();
+
+        // Start the destination VM
+        let mut dest_api_socket = temp_api_path(&guest.tmp_dir);
+        dest_api_socket.push_str(".dest");
+        let mut dest_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &dest_api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            // Make sure the source VM is functaionl
+            // Check the number of vCPUs
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
+
+            // Check the guest RAM
+            assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
+            // Increase the guest RAM
+            resize_command(&src_api_socket, None, Some(6 << 30), None, None);
+            thread::sleep(std::time::Duration::new(5, 0));
+            assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
+            // Use balloon to remove RAM from the VM
+            resize_command(&src_api_socket, None, None, Some(1 << 30), None);
+            thread::sleep(std::time::Duration::new(5, 0));
+            let total_memory = guest.get_total_memory().unwrap_or_default();
+            assert!(total_memory > 4_800_000);
+            assert!(total_memory < 5_760_000);
+
+            // Check the guest virtio-devices, e.g. block, rng, console, and net
+            guest.check_devices_common(None, Some(&console_text), Some(&pmem_path));
+
+            // x86_64: Following what's done in the `test_snapshot_restore`, we need
+            // to make sure that removing and adding back the virtio-net device does
+            // not break the live-migration support for virtio-pci.
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert!(remote_command(
+                    &src_api_socket,
+                    "remove-device",
+                    Some(net_id),
+                ));
+                thread::sleep(std::time::Duration::new(10, 0));
+
+                // Plug the virtio-net device again
+                assert!(remote_command(
+                    &src_api_socket,
+                    "add-net",
+                    Some(net_params.as_str()),
+                ));
+                thread::sleep(std::time::Duration::new(10, 0));
+            }
+
+            // Start the live-migration
+            let migration_socket = String::from(
+                guest
+                    .tmp_dir
+                    .as_path()
+                    .join("live-migration.sock")
+                    .to_str()
+                    .unwrap(),
+            );
+
+            assert!(
+                start_live_migration(&migration_socket, &src_api_socket, &dest_api_socket, local),
+                "Unsuccessful command: 'send-migration' or 'receive-migration'."
+            );
+        });
+
+        // Check and report any errors occured during the live-migration
+        if r.is_err() {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occured during live-migration",
+            );
+        }
+
+        // Check the source vm has been terminated successful (give it '3s' to settle)
+        thread::sleep(std::time::Duration::new(3, 0));
+        if !src_child.try_wait().unwrap().map_or(false, |s| s.success()) {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "source VM was not terminated successfully.",
+            );
+        };
+
+        // Post live-migration check to make sure the destination VM is funcational
+        let r = std::panic::catch_unwind(|| {
+            // Perform same checks to validate VM has been properly migrated
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
+            assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
+
+            guest.check_devices_common(None, Some(&console_text), Some(&pmem_path));
+
+            // Perform checks on guest RAM using balloon
+            let total_memory = guest.get_total_memory().unwrap_or_default();
+            assert!(total_memory > 4_800_000);
+            assert!(total_memory < 5_760_000);
+            // Deflate balloon to restore entire RAM to the VM
+            resize_command(&dest_api_socket, None, None, Some(0), None);
+            thread::sleep(std::time::Duration::new(5, 0));
+            assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
+            // Decrease guest RAM with virtio-mem
+            resize_command(&dest_api_socket, None, Some(5 << 30), None, None);
+            thread::sleep(std::time::Duration::new(5, 0));
+            let total_memory = guest.get_total_memory().unwrap_or_default();
+            assert!(total_memory > 4_800_000);
+            assert!(total_memory < 5_760_000);
+        });
+
+        // Clean-up the destination VM and make sure it terminated correctly
+        let _ = dest_child.kill();
+        let dest_output = dest_child.wait_with_output().unwrap();
+        handle_child_output(r, &dest_output);
+
+        // Check the destination VM has the expected 'concole_text' from its output
+        let r = std::panic::catch_unwind(|| {
+            assert!(String::from_utf8_lossy(&dest_output.stdout).contains(&console_text));
+        });
+        handle_child_output(r, &dest_output);
+    }
+
+    fn _test_live_migration_numa(upgrade_test: bool, local: bool) {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let kernel_path = direct_kernel_boot_path();
+        let console_text = String::from("On a branch floating down river a cricket, singing.");
+        let net_id = "net123";
+        let net_params = format!(
+            "id={},tap=,mac={},ip={},mask=255.255.255.0",
+            net_id, guest.network.guest_mac, guest.network.host_ip
+        );
+
+        let memory_param: &[&str] = if local {
+            &[
+                "--memory",
+                "size=0,hotplug_method=virtio-mem,shared=on",
+                "--memory-zone",
+                "id=mem0,size=1G,hotplug_size=4G,shared=on",
+                "id=mem1,size=1G,hotplug_size=4G,shared=on",
+                "id=mem2,size=2G,hotplug_size=4G,shared=on",
+                "--numa",
+                "guest_numa_id=0,cpus=[0-2,9],distances=[1@15,2@20],memory_zones=mem0",
+                "guest_numa_id=1,cpus=[3-4,6-8],distances=[0@20,2@25],memory_zones=mem1",
+                "guest_numa_id=2,cpus=[5,10-11],distances=[0@25,1@30],memory_zones=mem2",
+            ]
+        } else {
+            &[
+                "--memory",
+                "size=0,hotplug_method=virtio-mem",
+                "--memory-zone",
+                "id=mem0,size=1G,hotplug_size=4G",
+                "id=mem1,size=1G,hotplug_size=4G",
+                "id=mem2,size=2G,hotplug_size=4G",
+                "--numa",
+                "guest_numa_id=0,cpus=[0-2,9],distances=[1@15,2@20],memory_zones=mem0",
+                "guest_numa_id=1,cpus=[3-4,6-8],distances=[0@20,2@25],memory_zones=mem1",
+                "guest_numa_id=2,cpus=[5,10-11],distances=[0@25,1@30],memory_zones=mem2",
+            ]
+        };
+
+        let boot_vcpus = 6;
+        let max_vcpus = 12;
+
+        let pmem_temp_file = TempFile::new().unwrap();
+        pmem_temp_file.as_file().set_len(128 << 20).unwrap();
+        std::process::Command::new("mkfs.ext4")
+            .arg(pmem_temp_file.as_path())
+            .output()
+            .expect("Expect creating disk image to succeed");
+        let pmem_path = String::from("/dev/pmem0");
+
+        // Start the source VM
+        let src_vm_path = if !upgrade_test {
+            clh_command("cloud-hypervisor")
+        } else {
+            cloud_hypervisor_release_path()
+        };
+        let src_api_socket = temp_api_path(&guest.tmp_dir);
+        let mut src_vm_cmd = GuestCommand::new_with_binary_path(&guest, &src_vm_path);
+        src_vm_cmd
+            .args([
+                "--cpus",
+                format!("boot={},max={}", boot_vcpus, max_vcpus).as_str(),
+            ])
+            .args(memory_param)
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .default_disks()
+            .args(["--net", net_params.as_str()])
+            .args(["--api-socket", &src_api_socket])
+            .args([
+                "--pmem",
+                format!("file={}", pmem_temp_file.as_path().to_str().unwrap(),).as_str(),
+            ]);
+        let mut src_child = src_vm_cmd.capture_output().spawn().unwrap();
+
+        // Start the destination VM
+        let mut dest_api_socket = temp_api_path(&guest.tmp_dir);
+        dest_api_socket.push_str(".dest");
+        let mut dest_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &dest_api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            // Make sure the source VM is functaionl
+            // Check the number of vCPUs
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
+
+            // Check the guest RAM
+            assert!(guest.get_total_memory().unwrap_or_default() > 2_880_000);
 
             // Check the guest virtio-devices, e.g. block, rng, console, and net
             guest.check_devices_common(None, Some(&console_text), Some(&pmem_path));
@@ -7900,7 +8833,7 @@ mod live_migration {
             // Check the NUMA parameters are applied correctly and resize
             // each zone to test the case where we migrate a VM with the
             // virtio-mem regions being used.
-            if numa {
+            {
                 guest.check_numa_common(
                     Some(&[960_000, 960_000, 1_920_000]),
                     Some(&[vec![0, 1, 2], vec![3, 4], vec![5]]),
@@ -7945,12 +8878,6 @@ mod live_migration {
                 thread::sleep(std::time::Duration::new(10, 0));
             }
 
-            if watchdog {
-                let mut current_reboot_count = 1;
-                enable_guest_watchdog(&guest, &mut current_reboot_count);
-                check_guest_watchdog_no_reboot(&guest, &current_reboot_count);
-            }
-
             // Start the live-migration
             let migration_socket = String::from(
                 guest
@@ -7960,109 +8887,21 @@ mod live_migration {
                     .to_str()
                     .unwrap(),
             );
-            // Start to receive migration from the destintion VM
-            let mut receive_migration = Command::new(clh_command("ch-remote"))
-                .args(&[
-                    &format!("--api-socket={}", &dest_api_socket),
-                    "receive-migration",
-                    &format! {"unix:{}", migration_socket},
-                ])
-                .stderr(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            // Give it '1s' to make sure the 'migration_socket' file is properly created
-            thread::sleep(std::time::Duration::new(1, 0));
-            // Start to send migration from the source VM
 
-            let mut args = [
-                format!("--api-socket={}", &src_api_socket),
-                "send-migration".to_string(),
-                format! {"unix:{}", migration_socket},
-            ]
-            .to_vec();
-
-            if local {
-                args.insert(2, "--local".to_string());
-            }
-
-            let mut send_migration = Command::new(clh_command("ch-remote"))
-                .args(&args)
-                .stderr(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-
-            // The 'send-migration' command should be executed successfully within the given timeout
-            let success = if let Some(status) = send_migration
-                .wait_timeout(std::time::Duration::from_secs(30))
-                .unwrap()
-            {
-                status.success()
-            } else {
-                false
-            };
-
-            if !success {
-                let _ = send_migration.kill();
-                let output = send_migration.wait_with_output().unwrap();
-                eprintln!("\n\n==== Start 'send_migration' output ====\n\n---stdout---\n{}\n\n---stderr---\n{}\n\n==== End 'send_migration' output ====\n\n",
-                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            }
-
-            // The 'receive-migration' command should be executed successfully within the given timeout
-            let success = if let Some(status) = receive_migration
-                .wait_timeout(std::time::Duration::from_secs(30))
-                .unwrap()
-            {
-                status.success()
-            } else {
-                false
-            };
-
-            if !success {
-                let _ = receive_migration.kill();
-                let output = receive_migration.wait_with_output().unwrap();
-                eprintln!("\n\n==== Start 'receive_migration' output ====\n\n---stdout---\n{}\n\n---stderr---\n{}\n\n==== End 'receive_migration' output ====\n\n",
-                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            }
             assert!(
-                success,
+                start_live_migration(&migration_socket, &src_api_socket, &dest_api_socket, local),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
             );
         });
 
-        let print_and_panic = |src_vm: Child, dest_vm: Child, message: &str| -> ! {
-            let mut src_vm = src_vm;
-            let mut dest_vm = dest_vm;
-
-            let _ = src_vm.kill();
-            let src_output = src_vm.wait_with_output().unwrap();
-            eprintln!(
-                "\n\n==== Start 'source_vm' stdout ====\n\n{}\n\n==== End 'source_vm' stdout ====",
-                String::from_utf8_lossy(&src_output.stdout)
-            );
-            eprintln!(
-                "\n\n==== Start 'source_vm' stderr ====\n\n{}\n\n==== End 'source_vm' stderr ====",
-                String::from_utf8_lossy(&src_output.stderr)
-            );
-            let _ = dest_vm.kill();
-            let dest_output = dest_vm.wait_with_output().unwrap();
-            eprintln!(
-                    "\n\n==== Start 'destination_vm' stdout ====\n\n{}\n\n==== End 'destination_vm' stdout ====",
-                    String::from_utf8_lossy(&dest_output.stdout)
-                );
-            eprintln!(
-                    "\n\n==== Start 'destination_vm' stderr ====\n\n{}\n\n==== End 'destination_vm' stderr ====",
-                    String::from_utf8_lossy(&dest_output.stderr)
-                );
-
-            panic!("Test failed: {}", message)
-        };
-
         // Check and report any errors occured during the live-migration
         if r.is_err() {
-            print_and_panic(src_child, dest_child, "Error occured during live-migration");
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occured during live-migration",
+            );
         }
 
         // Check the source vm has been terminated successful (give it '3s' to settle)
@@ -8071,6 +8910,7 @@ mod live_migration {
             print_and_panic(
                 src_child,
                 dest_child,
+                None,
                 "source VM was not terminated successfully.",
             );
         };
@@ -8078,20 +8918,16 @@ mod live_migration {
         // Post live-migration check to make sure the destination VM is funcational
         let r = std::panic::catch_unwind(|| {
             // Perform same checks to validate VM has been properly migrated
-            assert_eq!(guest.get_cpu_count().unwrap_or_default(), 6);
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
             #[cfg(target_arch = "x86_64")]
-            if numa {
-                assert!(guest.get_total_memory().unwrap_or_default() > 6_720_000);
-            } else {
-                assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
-            }
+            assert!(guest.get_total_memory().unwrap_or_default() > 6_720_000);
             #[cfg(target_arch = "aarch64")]
             assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
 
             guest.check_devices_common(None, Some(&console_text), Some(&pmem_path));
 
             // Perform NUMA related checks
-            if numa {
+            {
                 #[cfg(target_arch = "aarch64")]
                 {
                     guest.check_numa_common(
@@ -8120,7 +8956,7 @@ mod live_migration {
                     resize_zone_command(&dest_api_socket, "mem2", "4G");
                     // Resize to the maximum amount of CPUs and check each NUMA
                     // node has been assigned the right CPUs set.
-                    resize_command(&dest_api_socket, Some(12), None, None, None);
+                    resize_command(&dest_api_socket, Some(max_vcpus), None, None, None);
                     thread::sleep(std::time::Duration::new(5, 0));
 
                     guest.check_numa_common(
@@ -8129,32 +8965,6 @@ mod live_migration {
                         None,
                     );
                 }
-            }
-
-            if watchdog {
-                let mut current_reboot_count = 2;
-                check_guest_watchdog_no_reboot(&guest, &current_reboot_count);
-                check_guest_watchdog_one_reboot(
-                    &guest,
-                    &dest_api_socket,
-                    &mut current_reboot_count,
-                );
-            }
-
-            if balloon {
-                let total_memory = guest.get_total_memory().unwrap_or_default();
-                assert!(total_memory > 4_800_000);
-                assert!(total_memory < 5_760_000);
-                // Deflate balloon to restore entire RAM to the VM
-                resize_command(&dest_api_socket, None, None, Some(0), None);
-                thread::sleep(std::time::Duration::new(5, 0));
-                assert!(guest.get_total_memory().unwrap_or_default() > 5_760_000);
-                // Decrease guest RAM with virtio-mem
-                resize_command(&dest_api_socket, None, Some(5 << 30), None, None);
-                thread::sleep(std::time::Duration::new(5, 0));
-                let total_memory = guest.get_total_memory().unwrap_or_default();
-                assert!(total_memory > 4_800_000);
-                assert!(total_memory < 5_760_000);
             }
         });
 
@@ -8170,96 +8980,206 @@ mod live_migration {
         handle_child_output(r, &dest_output);
     }
 
-    #[test]
-    fn test_live_migration_basic() {
-        _test_live_migration(false, false, false, false, false)
-    }
+    fn _test_live_migration_watchdog(upgrade_test: bool, local: bool) {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let kernel_path = direct_kernel_boot_path();
+        let console_text = String::from("On a branch floating down river a cricket, singing.");
+        let net_id = "net123";
+        let net_params = format!(
+            "id={},tap=,mac={},ip={},mask=255.255.255.0",
+            net_id, guest.network.guest_mac, guest.network.host_ip
+        );
 
-    #[test]
-    fn test_live_migration_local() {
-        _test_live_migration(false, false, true, false, false)
-    }
+        let memory_param: &[&str] = if local {
+            &["--memory", "size=4G,shared=on"]
+        } else {
+            &["--memory", "size=4G"]
+        };
 
-    #[test]
-    #[cfg(not(feature = "mshv"))]
-    fn test_live_migration_numa() {
-        _test_live_migration(false, true, false, false, false)
-    }
+        let boot_vcpus = 2;
+        let max_vcpus = 4;
 
-    #[test]
-    #[cfg(not(feature = "mshv"))]
-    fn test_live_migration_numa_local() {
-        _test_live_migration(false, true, true, false, false)
-    }
+        let pmem_temp_file = TempFile::new().unwrap();
+        pmem_temp_file.as_file().set_len(128 << 20).unwrap();
+        std::process::Command::new("mkfs.ext4")
+            .arg(pmem_temp_file.as_path())
+            .output()
+            .expect("Expect creating disk image to succeed");
+        let pmem_path = String::from("/dev/pmem0");
 
-    #[test]
-    fn test_live_migration_watchdog() {
-        _test_live_migration(false, false, false, true, false)
-    }
+        // Start the source VM
+        let src_vm_path = if !upgrade_test {
+            clh_command("cloud-hypervisor")
+        } else {
+            cloud_hypervisor_release_path()
+        };
+        let src_api_socket = temp_api_path(&guest.tmp_dir);
+        let mut src_vm_cmd = GuestCommand::new_with_binary_path(&guest, &src_vm_path);
+        src_vm_cmd
+            .args([
+                "--cpus",
+                format!("boot={},max={}", boot_vcpus, max_vcpus).as_str(),
+            ])
+            .args(memory_param)
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .default_disks()
+            .args(["--net", net_params.as_str()])
+            .args(["--api-socket", &src_api_socket])
+            .args([
+                "--pmem",
+                format!("file={}", pmem_temp_file.as_path().to_str().unwrap(),).as_str(),
+            ])
+            .args(["--watchdog"]);
+        let mut src_child = src_vm_cmd.capture_output().spawn().unwrap();
 
-    #[test]
-    fn test_live_migration_watchdog_local() {
-        _test_live_migration(false, false, true, true, false)
-    }
+        // Start the destination VM
+        let mut dest_api_socket = temp_api_path(&guest.tmp_dir);
+        dest_api_socket.push_str(".dest");
+        let mut dest_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &dest_api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
 
-    #[test]
-    fn test_live_migration_balloon() {
-        _test_live_migration(false, false, false, false, true)
-    }
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
 
-    #[test]
-    fn test_live_migration_balloon_local() {
-        _test_live_migration(false, false, true, false, true)
-    }
+            // Make sure the source VM is functaionl
+            // Check the number of vCPUs
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
+            // Check the guest RAM
+            assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
+            // Check the guest virtio-devices, e.g. block, rng, console, and net
+            guest.check_devices_common(None, Some(&console_text), Some(&pmem_path));
+            // x86_64: Following what's done in the `test_snapshot_restore`, we need
+            // to make sure that removing and adding back the virtio-net device does
+            // not break the live-migration support for virtio-pci.
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert!(remote_command(
+                    &src_api_socket,
+                    "remove-device",
+                    Some(net_id),
+                ));
+                thread::sleep(std::time::Duration::new(10, 0));
 
-    #[test]
-    #[ignore]
-    fn test_live_upgrade_basic() {
-        _test_live_migration(true, false, false, false, false)
-    }
+                // Plug the virtio-net device again
+                assert!(remote_command(
+                    &src_api_socket,
+                    "add-net",
+                    Some(net_params.as_str()),
+                ));
+                thread::sleep(std::time::Duration::new(10, 0));
+            }
 
-    #[test]
-    #[ignore]
-    fn test_live_upgrade_local() {
-        _test_live_migration(true, false, true, false, false)
-    }
+            // Enable watchdog and ensure its functional
+            let mut expected_reboot_count = 1;
+            // Enable the watchdog with a 15s timeout
+            enable_guest_watchdog(&guest, 15);
+            // Reboot and check that systemd has activated the watchdog
+            guest.ssh_command("sudo reboot").unwrap();
+            guest.wait_vm_boot(None).unwrap();
+            expected_reboot_count += 1;
+            assert_eq!(get_reboot_count(&guest), expected_reboot_count);
+            assert_eq!(
+                guest
+                    .ssh_command("sudo journalctl | grep -c -- \"Watchdog started\"")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                2
+            );
+            // Allow some normal time to elapse to check we don't get spurious reboots
+            thread::sleep(std::time::Duration::new(40, 0));
+            // Check no reboot
+            assert_eq!(get_reboot_count(&guest), expected_reboot_count);
 
-    #[test]
-    #[ignore]
-    #[cfg(not(feature = "mshv"))]
-    fn test_live_upgrade_numa() {
-        _test_live_migration(true, true, false, false, false)
-    }
+            // Start the live-migration
+            let migration_socket = String::from(
+                guest
+                    .tmp_dir
+                    .as_path()
+                    .join("live-migration.sock")
+                    .to_str()
+                    .unwrap(),
+            );
 
-    #[test]
-    #[ignore]
-    #[cfg(not(feature = "mshv"))]
-    fn test_live_upgrade_numa_local() {
-        _test_live_migration(true, true, true, false, false)
-    }
+            assert!(
+                start_live_migration(&migration_socket, &src_api_socket, &dest_api_socket, local),
+                "Unsuccessful command: 'send-migration' or 'receive-migration'."
+            );
+        });
 
-    #[test]
-    #[ignore]
-    fn test_live_upgrade_watchdog() {
-        _test_live_migration(true, false, false, true, false)
-    }
+        // Check and report any errors occured during the live-migration
+        if r.is_err() {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occured during live-migration",
+            );
+        }
 
-    #[test]
-    #[ignore]
-    fn test_live_upgrade_watchdog_local() {
-        _test_live_migration(true, false, true, true, false)
-    }
+        // Check the source vm has been terminated successful (give it '3s' to settle)
+        thread::sleep(std::time::Duration::new(3, 0));
+        if !src_child.try_wait().unwrap().map_or(false, |s| s.success()) {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "source VM was not terminated successfully.",
+            );
+        };
 
-    #[test]
-    #[ignore]
-    fn test_live_upgrade_balloon() {
-        _test_live_migration(true, false, false, false, true)
-    }
+        // Post live-migration check to make sure the destination VM is funcational
+        let r = std::panic::catch_unwind(|| {
+            // Perform same checks to validate VM has been properly migrated
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), boot_vcpus);
+            assert!(guest.get_total_memory().unwrap_or_default() > 3_840_000);
 
-    #[test]
-    #[ignore]
-    fn test_live_upgrade_balloon_local() {
-        _test_live_migration(true, false, true, false, true)
+            guest.check_devices_common(None, Some(&console_text), Some(&pmem_path));
+
+            // Perform checks on watchdog
+            let mut expected_reboot_count = 2;
+
+            // Allow some normal time to elapse to check we don't get spurious reboots
+            thread::sleep(std::time::Duration::new(40, 0));
+            // Check no reboot
+            assert_eq!(get_reboot_count(&guest), expected_reboot_count);
+
+            // Trigger a panic (sync first). We need to do this inside a screen with a delay so the SSH command returns.
+            guest.ssh_command("screen -dmS reboot sh -c \"sleep 5; echo s | tee /proc/sysrq-trigger; echo c | sudo tee /proc/sysrq-trigger\"").unwrap();
+            // Allow some time for the watchdog to trigger (max 30s) and reboot to happen
+            guest.wait_vm_boot(Some(50)).unwrap();
+            // Check a reboot is triggerred by the watchdog
+            expected_reboot_count += 1;
+            assert_eq!(get_reboot_count(&guest), expected_reboot_count);
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Now pause the VM and remain offline for 30s
+                assert!(remote_command(&dest_api_socket, "pause", None));
+                thread::sleep(std::time::Duration::new(30, 0));
+                assert!(remote_command(&dest_api_socket, "resume", None));
+
+                // Check no reboot
+                assert_eq!(get_reboot_count(&guest), expected_reboot_count);
+            }
+        });
+
+        // Clean-up the destination VM and make sure it terminated correctly
+        let _ = dest_child.kill();
+        let dest_output = dest_child.wait_with_output().unwrap();
+        handle_child_output(r, &dest_output);
+
+        // Check the destination VM has the expected 'concole_text' from its output
+        let r = std::panic::catch_unwind(|| {
+            assert!(String::from_utf8_lossy(&dest_output.stdout).contains(&console_text));
+        });
+        handle_child_output(r, &dest_output);
     }
 
     fn _test_live_migration_ovs_dpdk(upgrade_test: bool, local: bool) {
@@ -8278,7 +9198,7 @@ mod live_migration {
         let mut dest_api_socket = temp_api_path(&migration_guest.tmp_dir);
         dest_api_socket.push_str(".dest");
         let mut dest_child = GuestCommand::new(&migration_guest)
-            .args(&["--api-socket", &dest_api_socket])
+            .args(["--api-socket", &dest_api_socket])
             .capture_output()
             .spawn()
             .unwrap();
@@ -8296,124 +9216,19 @@ mod live_migration {
                     .to_str()
                     .unwrap(),
             );
-            // Start to receive migration from the destintion VM
-            let mut receive_migration = Command::new(clh_command("ch-remote"))
-                .args(&[
-                    &format!("--api-socket={}", &dest_api_socket),
-                    "receive-migration",
-                    &format! {"unix:{}", migration_socket},
-                ])
-                .stderr(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            // Give it '1s' to make sure the 'migration_socket' file is properly created
-            thread::sleep(std::time::Duration::new(1, 0));
-            // Start to send migration from the source VM
-            let mut args = [
-                format!("--api-socket={}", &src_api_socket),
-                "send-migration".to_string(),
-                format! {"unix:{}", migration_socket},
-            ]
-            .to_vec();
 
-            if local {
-                args.insert(2, "--local".to_string());
-            }
-
-            let mut send_migration = Command::new(clh_command("ch-remote"))
-                .args(&args)
-                .stderr(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-
-            // The 'send-migration' command should be executed successfully within the given timeout
-            let success = if let Some(status) = send_migration
-                .wait_timeout(std::time::Duration::from_secs(30))
-                .unwrap()
-            {
-                status.success()
-            } else {
-                false
-            };
-
-            if !success {
-                let _ = send_migration.kill();
-                let output = send_migration.wait_with_output().unwrap();
-                eprintln!("\n\n==== Start 'send_migration' output ====\n\n---stdout---\n{}\n\n---stderr---\n{}\n\n==== End 'send_migration' output ====\n\n",
-                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            }
-
-            // The 'receive-migration' command should be executed successfully within the given timeout
-            let success = if let Some(status) = receive_migration
-                .wait_timeout(std::time::Duration::from_secs(30))
-                .unwrap()
-            {
-                status.success()
-            } else {
-                false
-            };
-
-            if !success {
-                let _ = receive_migration.kill();
-                let output = receive_migration.wait_with_output().unwrap();
-                eprintln!("\n\n==== Start 'receive_migration' output ====\n\n---stdout---\n{}\n\n---stderr---\n{}\n\n==== End 'receive_migration' output ====\n\n",
-                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-            }
             assert!(
-                success,
+                start_live_migration(&migration_socket, &src_api_socket, &dest_api_socket, local),
                 "Unsuccessful command: 'send-migration' or 'receive-migration'."
             );
         });
-
-        let print_and_panic = |src_vm: Child, dest_vm: Child, ovs_vm: Child, message: &str| -> ! {
-            let mut src_vm = src_vm;
-            let mut dest_vm = dest_vm;
-            let mut ovs_vm = ovs_vm;
-
-            let _ = src_vm.kill();
-            let src_output = src_vm.wait_with_output().unwrap();
-            eprintln!(
-                "\n\n==== Start 'source_vm' stdout ====\n\n{}\n\n==== End 'source_vm' stdout ====",
-                String::from_utf8_lossy(&src_output.stdout)
-            );
-            eprintln!(
-                "\n\n==== Start 'source_vm' stderr ====\n\n{}\n\n==== End 'source_vm' stderr ====",
-                String::from_utf8_lossy(&src_output.stderr)
-            );
-            let _ = dest_vm.kill();
-            let dest_output = dest_vm.wait_with_output().unwrap();
-            eprintln!(
-                    "\n\n==== Start 'destination_vm' stdout ====\n\n{}\n\n==== End 'destination_vm' stdout ====",
-                    String::from_utf8_lossy(&dest_output.stdout)
-                );
-            eprintln!(
-                    "\n\n==== Start 'destination_vm' stderr ====\n\n{}\n\n==== End 'destination_vm' stderr ====",
-                    String::from_utf8_lossy(&dest_output.stderr)
-                );
-            let _ = ovs_vm.kill();
-            let ovs_output = ovs_vm.wait_with_output().unwrap();
-            eprintln!(
-                "\n\n==== Start 'ovs_vm' stdout ====\n\n{}\n\n==== End 'ovs_vm' stdout ====",
-                String::from_utf8_lossy(&ovs_output.stdout)
-            );
-            eprintln!(
-                "\n\n==== Start 'ovs_vm' stderr ====\n\n{}\n\n==== End 'ovs_vm' stderr ====",
-                String::from_utf8_lossy(&ovs_output.stderr)
-            );
-
-            cleanup_ovs_dpdk();
-
-            panic!("Test failed: {}", message)
-        };
 
         // Check and report any errors occured during the live-migration
         if r.is_err() {
             print_and_panic(
                 src_child,
                 dest_child,
-                ovs_child,
+                Some(ovs_child),
                 "Error occured during live-migration",
             );
         }
@@ -8424,7 +9239,7 @@ mod live_migration {
             print_and_panic(
                 src_child,
                 dest_child,
-                ovs_child,
+                Some(ovs_child),
                 "source VM was not terminated successfully.",
             );
         };
@@ -8451,43 +9266,140 @@ mod live_migration {
             migration_guest
                 .ssh_command("nc -vz 172.100.0.1 12345")
                 .unwrap();
-
-            cleanup_ovs_dpdk();
         });
 
         // Clean-up the destination VM and OVS VM, and make sure they terminated correctly
         let _ = dest_child.kill();
         let _ = ovs_child.kill();
         let dest_output = dest_child.wait_with_output().unwrap();
-        handle_child_output(r, &dest_output);
         let ovs_output = ovs_child.wait_with_output().unwrap();
+
+        cleanup_ovs_dpdk();
+
+        handle_child_output(r, &dest_output);
         handle_child_output(Ok(()), &ovs_output);
     }
 
-    #[test]
-    #[cfg(not(feature = "mshv"))]
-    fn test_live_migration_ovs_dpdk() {
-        _test_live_migration_ovs_dpdk(false, false);
+    mod live_migration_parallel {
+        use super::*;
+        #[test]
+        fn test_live_migration_basic() {
+            _test_live_migration(false, false)
+        }
+
+        #[test]
+        fn test_live_migration_local() {
+            _test_live_migration(false, true)
+        }
+
+        #[test]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_migration_numa() {
+            _test_live_migration_numa(false, false)
+        }
+
+        #[test]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_migration_numa_local() {
+            _test_live_migration_numa(false, true)
+        }
+
+        #[test]
+        fn test_live_migration_watchdog() {
+            _test_live_migration_watchdog(false, false)
+        }
+
+        #[test]
+        fn test_live_migration_watchdog_local() {
+            _test_live_migration_watchdog(false, true)
+        }
+
+        #[test]
+        fn test_live_migration_balloon() {
+            _test_live_migration_balloon(false, false)
+        }
+
+        #[test]
+        fn test_live_migration_balloon_local() {
+            _test_live_migration_balloon(false, true)
+        }
+
+        #[test]
+        fn test_live_upgrade_basic() {
+            _test_live_migration(true, false)
+        }
+
+        #[test]
+        fn test_live_upgrade_local() {
+            _test_live_migration(true, true)
+        }
+
+        #[test]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_upgrade_numa() {
+            _test_live_migration_numa(true, false)
+        }
+
+        #[test]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_upgrade_numa_local() {
+            _test_live_migration_numa(true, true)
+        }
+
+        #[test]
+        fn test_live_upgrade_watchdog() {
+            _test_live_migration_watchdog(true, false)
+        }
+
+        #[test]
+        fn test_live_upgrade_watchdog_local() {
+            _test_live_migration_watchdog(true, true)
+        }
+
+        #[test]
+        fn test_live_upgrade_balloon() {
+            _test_live_migration_balloon(true, false)
+        }
+
+        #[test]
+        fn test_live_upgrade_balloon_local() {
+            _test_live_migration_balloon(true, true)
+        }
     }
 
-    #[test]
-    #[cfg(not(feature = "mshv"))]
-    fn test_live_migration_ovs_dpdk_local() {
-        _test_live_migration_ovs_dpdk(false, true);
-    }
+    mod live_migration_sequential {
+        #[cfg(target_arch = "x86_64")]
+        #[cfg(not(feature = "mshv"))]
+        use super::*;
 
-    #[test]
-    #[ignore]
-    #[cfg(not(feature = "mshv"))]
-    fn test_live_upgrade_ovs_dpdk() {
-        _test_live_migration_ovs_dpdk(true, false);
-    }
+        // Require to run ovs-dpdk tests sequentially because they rely on the same ovs-dpdk setup
+        #[test]
+        #[cfg(target_arch = "x86_64")]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_migration_ovs_dpdk() {
+            _test_live_migration_ovs_dpdk(false, false);
+        }
 
-    #[test]
-    #[ignore]
-    #[cfg(not(feature = "mshv"))]
-    fn test_live_upgrade_ovs_dpdk_local() {
-        _test_live_migration_ovs_dpdk(true, true);
+        #[test]
+        #[cfg(target_arch = "x86_64")]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_migration_ovs_dpdk_local() {
+            _test_live_migration_ovs_dpdk(false, true);
+        }
+
+        #[test]
+        #[cfg(target_arch = "x86_64")]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_upgrade_ovs_dpdk() {
+            _test_live_migration_ovs_dpdk(true, false);
+        }
+
+        #[test]
+        #[cfg(target_arch = "x86_64")]
+        #[cfg(not(feature = "mshv"))]
+        fn test_live_upgrade_ovs_dpdk_local() {
+            _test_live_migration_ovs_dpdk(true, true);
+        }
     }
 }
 
@@ -8503,12 +9415,12 @@ mod aarch64_acpi {
             let guest = Guest::new(disk_config);
 
             let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus", "boot=1"])
-                .args(&["--memory", "size=512M"])
-                .args(&["--kernel", edk2_path().to_str().unwrap()])
+                .args(["--cpus", "boot=1"])
+                .args(["--memory", "size=512M"])
+                .args(["--kernel", edk2_path().to_str().unwrap()])
                 .default_disks()
                 .default_net()
-                .args(&["--serial", "tty", "--console", "off"])
+                .args(["--serial", "tty", "--console", "off"])
                 .capture_output()
                 .spawn()
                 .unwrap();
@@ -8556,5 +9468,181 @@ mod aarch64_acpi {
     #[test]
     fn test_virtio_iommu() {
         _test_virtio_iommu(true)
+    }
+}
+
+mod rate_limiter {
+    use super::*;
+
+    // Check if the 'measured' rate is within the expected 'difference' (in percentage)
+    // compared to given 'limit' rate.
+    fn check_rate_limit(measured: f64, limit: f64, difference: f64) -> bool {
+        let upper_limit = limit * (1_f64 + difference);
+        let lower_limit = limit * (1_f64 - difference);
+
+        if measured > lower_limit && measured < upper_limit {
+            return true;
+        }
+
+        eprintln!(
+            "\n\n==== check_rate_limit failed! ====\n\nmeasured={}, , lower_limit={}, upper_limit={}\n\n",
+            measured, lower_limit, upper_limit
+        );
+
+        false
+    }
+
+    fn _test_rate_limiter_net(rx: bool) {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        let test_timeout = 10;
+        let num_queues = 2;
+        let queue_size = 256;
+        let bw_size = 10485760_u64; // bytes
+        let bw_refill_time = 100; // ms
+        let limit_bps = (bw_size * 8 * 1000) as f64 / bw_refill_time as f64;
+
+        let net_params = format!(
+            "tap=,mac={},ip={},mask=255.255.255.0,num_queues={},queue_size={},bw_size={},bw_refill_time={}",
+            guest.network.guest_mac,
+            guest.network.host_ip,
+            num_queues,
+            queue_size,
+            bw_size,
+            bw_refill_time,
+        );
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", &format!("boot={}", num_queues / 2)])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .default_disks()
+            .args(["--net", net_params.as_str()])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+            let measured_bps =
+                measure_virtio_net_throughput(test_timeout, num_queues / 2, &guest, rx).unwrap();
+            assert!(check_rate_limit(measured_bps, limit_bps, 0.1));
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_rate_limiter_net_rx() {
+        _test_rate_limiter_net(true);
+    }
+
+    #[test]
+    fn test_rate_limiter_net_tx() {
+        _test_rate_limiter_net(false);
+    }
+
+    fn _test_rate_limiter_block(bandwidth: bool) {
+        let test_timeout = 10;
+        let num_queues = 1;
+        let fio_ops = FioOps::RandRW;
+
+        let bw_size = if bandwidth {
+            10485760_u64 // bytes
+        } else {
+            100_u64 // I/O
+        };
+        let bw_refill_time = 100; // ms
+        let limit_rate = (bw_size * 1000) as f64 / bw_refill_time as f64;
+
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let test_img_dir = TempDir::new_with_prefix("/var/tmp/ch").unwrap();
+        let blk_rate_limiter_test_img =
+            String::from(test_img_dir.as_path().join("blk.img").to_str().unwrap());
+
+        // Create the test block image
+        assert!(exec_host_command_output(&format!(
+            "dd if=/dev/zero of={} bs=1M count=1024",
+            blk_rate_limiter_test_img
+        ))
+        .status
+        .success());
+
+        let test_blk_params = if bandwidth {
+            format!(
+                "path={},bw_size={},bw_refill_time={}",
+                blk_rate_limiter_test_img, bw_size, bw_refill_time
+            )
+        } else {
+            format!(
+                "path={},ops_size={},ops_refill_time={}",
+                blk_rate_limiter_test_img, bw_size, bw_refill_time
+            )
+        };
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", &format!("boot={}", num_queues)])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args([
+                "--disk",
+                format!(
+                    "path={}",
+                    guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
+                )
+                .as_str(),
+                format!(
+                    "path={}",
+                    guest.disk_config.disk(DiskType::CloudInit).unwrap()
+                )
+                .as_str(),
+                test_blk_params.as_str(),
+            ])
+            .default_net()
+            .args(["--api-socket", &api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            let fio_command = format!(
+                "sudo fio --filename=/dev/vdc --name=test --output-format=json \
+                --direct=1 --bs=4k --ioengine=io_uring --iodepth=64 \
+                --rw={} --runtime={} --numjobs={}",
+                fio_ops, test_timeout, num_queues
+            );
+            let output = guest.ssh_command(&fio_command).unwrap();
+
+            // Parse fio output
+            let measured_rate = if bandwidth {
+                parse_fio_output(&output, &fio_ops, num_queues).unwrap()
+            } else {
+                parse_fio_output_iops(&output, &fio_ops, num_queues).unwrap()
+            };
+            assert!(check_rate_limit(measured_rate, limit_rate, 0.1));
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_rate_limiter_block_bandwidth() {
+        _test_rate_limiter_block(true)
+    }
+
+    #[test]
+    fn test_rate_limiter_block_iops() {
+        _test_rate_limiter_block(false)
     }
 }

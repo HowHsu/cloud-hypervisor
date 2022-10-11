@@ -11,21 +11,15 @@
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::VcpuInit;
 #[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::gic::Vgic;
-use crate::cpu::Vcpu;
-use crate::device::Device;
-#[cfg(feature = "kvm")]
-use crate::kvm::KvmVmState as VmState;
-#[cfg(feature = "mshv")]
-use crate::mshv::HvState as VmState;
+use crate::arch::aarch64::gic::{Vgic, VgicConfig};
 #[cfg(feature = "tdx")]
-use crate::x86_64::CpuId;
-#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+use crate::arch::x86::CpuIdEntry;
+use crate::cpu::Vcpu;
+#[cfg(target_arch = "x86_64")]
 use crate::ClockData;
-use crate::CreateDevice;
-use crate::{IoEventAddress, IrqRoutingEntry, MemoryRegion};
-#[cfg(feature = "kvm")]
-use kvm_ioctls::Cap;
+use crate::UserMemoryRegion;
+use crate::{IoEventAddress, IrqRoutingEntry};
+use std::any::Any;
 #[cfg(target_arch = "x86_64")]
 use std::fs::File;
 use std::sync::Arc;
@@ -263,7 +257,7 @@ pub enum InterruptSourceConfig {
 ///
 /// This crate provides a hypervisor-agnostic interfaces for Vm
 ///
-pub trait Vm: Send + Sync {
+pub trait Vm: Send + Sync + Any {
     #[cfg(target_arch = "x86_64")]
     /// Sets the address of the one-page region in the VM's address space.
     fn set_identity_map_address(&self, address: u64) -> Result<()>;
@@ -279,15 +273,7 @@ pub trait Vm: Send + Sync {
     /// Creates a new KVM vCPU file descriptor and maps the memory corresponding
     fn create_vcpu(&self, id: u8, vm_ops: Option<Arc<dyn VmOps>>) -> Result<Arc<dyn Vcpu>>;
     #[cfg(target_arch = "aarch64")]
-    fn create_vgic(
-        &self,
-        vcpu_count: u64,
-        dist_addr: u64,
-        dist_size: u64,
-        redist_size: u64,
-        msi_size: u64,
-        nr_irqs: u32,
-    ) -> Result<Arc<Mutex<dyn Vgic>>>;
+    fn create_vgic(&self, config: VgicConfig) -> Result<Arc<Mutex<dyn Vgic>>>;
 
     /// Registers an event to be signaled whenever a certain address is written to.
     fn register_ioevent(
@@ -311,15 +297,13 @@ pub trait Vm: Send + Sync {
         userspace_addr: u64,
         readonly: bool,
         log_dirty_pages: bool,
-    ) -> MemoryRegion;
+    ) -> UserMemoryRegion;
     /// Creates a guest physical memory slot.
-    fn create_user_memory_region(&self, user_memory_region: MemoryRegion) -> Result<()>;
+    fn create_user_memory_region(&self, user_memory_region: UserMemoryRegion) -> Result<()>;
     /// Removes a guest physical memory slot.
-    fn remove_user_memory_region(&self, user_memory_region: MemoryRegion) -> Result<()>;
-    /// Creates an emulated device in the kernel.
-    fn create_device(&self, device: &mut CreateDevice) -> Result<Arc<dyn Device>>;
+    fn remove_user_memory_region(&self, user_memory_region: UserMemoryRegion) -> Result<()>;
     /// Returns the preferred CPU target type which can be emulated by KVM on underlying host.
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     fn get_preferred_target(&self, kvi: &mut VcpuInit) -> Result<()>;
     /// Enable split Irq capability
     #[cfg(target_arch = "x86_64")]
@@ -327,20 +311,13 @@ pub trait Vm: Send + Sync {
     #[cfg(target_arch = "x86_64")]
     fn enable_sgx_attribute(&self, file: File) -> Result<()>;
     /// Retrieve guest clock.
-    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     fn get_clock(&self) -> Result<ClockData>;
     /// Set guest clock.
-    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     fn set_clock(&self, data: &ClockData) -> Result<()>;
-    #[cfg(feature = "kvm")]
-    /// Checks if a particular `Cap` is available.
-    fn check_extension(&self, c: Cap) -> bool;
     /// Create a device that is used for passthrough
-    fn create_passthrough_device(&self) -> Result<Arc<dyn Device>>;
-    /// Get the Vm state. Return VM specific data
-    fn state(&self) -> Result<VmState>;
-    /// Set the VM state
-    fn set_state(&self, state: VmState) -> Result<()>;
+    fn create_passthrough_device(&self) -> Result<vfio_ioctls::VfioDeviceFd>;
     /// Start logging dirty pages
     fn start_dirty_log(&self) -> Result<()>;
     /// Stop logging dirty pages
@@ -349,19 +326,27 @@ pub trait Vm: Send + Sync {
     fn get_dirty_log(&self, slot: u32, base_gpa: u64, memory_size: u64) -> Result<Vec<u64>>;
     #[cfg(feature = "tdx")]
     /// Initalize TDX on this VM
-    fn tdx_init(&self, cpuid: &CpuId, max_vcpus: u32) -> Result<()>;
+    fn tdx_init(&self, _cpuid: &[CpuIdEntry], _max_vcpus: u32) -> Result<()> {
+        unimplemented!()
+    }
     #[cfg(feature = "tdx")]
     /// Finalize the configuration of TDX on this VM
-    fn tdx_finalize(&self) -> Result<()>;
+    fn tdx_finalize(&self) -> Result<()> {
+        unimplemented!()
+    }
     #[cfg(feature = "tdx")]
     /// Initalize a TDX memory region for this VM
     fn tdx_init_memory_region(
         &self,
-        host_address: u64,
-        guest_address: u64,
-        size: u64,
-        measure: bool,
-    ) -> Result<()>;
+        _host_address: u64,
+        _guest_address: u64,
+        _size: u64,
+        _measure: bool,
+    ) -> Result<()> {
+        unimplemented!()
+    }
+    /// Downcast to the underlying hypervisor VM type
+    fn as_any(&self) -> &dyn Any;
 }
 
 pub trait VmOps: Send + Sync {

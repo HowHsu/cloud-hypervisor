@@ -20,6 +20,7 @@ use std::{
     thread,
     time::Duration,
 };
+use test_infra::FioOps;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -51,7 +52,7 @@ pub struct MetricsReport {
 impl Default for MetricsReport {
     fn default() -> Self {
         let mut git_human_readable = "".to_string();
-        if let Ok(git_out) = Command::new("git").args(&["describe", "--dirty"]).output() {
+        if let Ok(git_out) = Command::new("git").args(["describe", "--dirty"]).output() {
             if git_out.status.success() {
                 git_human_readable = String::from_utf8(git_out.stdout)
                     .unwrap()
@@ -66,7 +67,7 @@ impl Default for MetricsReport {
         }
 
         let mut git_revision = "".to_string();
-        if let Ok(git_out) = Command::new("git").args(&["rev-parse", "HEAD"]).output() {
+        if let Ok(git_out) = Command::new("git").args(["rev-parse", "HEAD"]).output() {
             if git_out.status.success() {
                 git_revision = String::from_utf8(git_out.stdout)
                     .unwrap()
@@ -82,7 +83,7 @@ impl Default for MetricsReport {
 
         let mut git_commit_date = "".to_string();
         if let Ok(git_out) = Command::new("git")
-            .args(&["show", "-s", "--format=%cd"])
+            .args(["show", "-s", "--format=%cd"])
             .output()
         {
             if git_out.status.success() {

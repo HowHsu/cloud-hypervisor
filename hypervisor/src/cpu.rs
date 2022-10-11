@@ -9,28 +9,16 @@
 //
 
 #[cfg(target_arch = "aarch64")]
-use crate::aarch64::VcpuInit;
-#[cfg(target_arch = "aarch64")]
-use crate::aarch64::{RegList, Register, StandardRegisters};
+use crate::aarch64::{RegList, StandardRegisters, VcpuInit};
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86::{
+    CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, StandardRegisters,
+};
 #[cfg(feature = "tdx")]
 use crate::kvm::{TdxExitDetails, TdxExitStatus};
-#[cfg(all(feature = "mshv", target_arch = "x86_64"))]
-use crate::x86_64::SuspendRegisters;
-#[cfg(target_arch = "x86_64")]
-use crate::x86_64::Xsave;
-#[cfg(target_arch = "x86_64")]
-use crate::x86_64::{CpuId, LapicState};
-#[cfg(target_arch = "x86_64")]
-use crate::x86_64::{
-    ExtendedControlRegisters, FpuState, MsrEntries, SpecialRegisters, StandardRegisters, VcpuEvents,
-};
 use crate::CpuState;
-#[cfg(target_arch = "aarch64")]
-use crate::DeviceAttr;
-#[cfg(feature = "kvm")]
 use crate::MpState;
 use thiserror::Error;
-#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use vm_memory::GuestAddress;
 
 #[derive(Error, Debug)]
@@ -47,11 +35,6 @@ pub enum HypervisorCpuError {
     ///
     #[error("Failed to get standard registers: {0}")]
     GetStandardRegs(#[source] anyhow::Error),
-    ///
-    /// Getting suspend registers error
-    ///
-    #[error("Failed to get suspend registers: {0}")]
-    GetSuspendRegs(#[source] anyhow::Error),
     ///
     /// Setting special register error
     ///
@@ -248,6 +231,12 @@ pub enum HypervisorCpuError {
     #[cfg(feature = "tdx")]
     #[error("Unknown TDX VM call")]
     UnknownTdxVmCall,
+    #[cfg(target_arch = "aarch64")]
+    ///
+    /// Failed to intialize PMU
+    ///
+    #[error("Failed to initialize PMU")]
+    InitializePmu,
 }
 
 #[derive(Debug)]
@@ -278,22 +267,10 @@ pub type Result<T> = anyhow::Result<T, HypervisorCpuError>;
 /// Trait to represent a generic Vcpu
 ///
 pub trait Vcpu: Send + Sync {
-    #[cfg(target_arch = "x86_64")]
     ///
     /// Returns the vCPU general purpose registers.
     ///
     fn get_regs(&self) -> Result<StandardRegisters>;
-    #[cfg(target_arch = "aarch64")]
-    ///
-    /// Sets vcpu attribute
-    ///
-    fn set_vcpu_attr(&self, attr: &DeviceAttr) -> Result<()>;
-    #[cfg(target_arch = "aarch64")]
-    ///
-    /// Check if vcpu has attribute.
-    ///
-    fn has_vcpu_attr(&self, attr: &DeviceAttr) -> Result<()>;
-    #[cfg(target_arch = "x86_64")]
     ///
     /// Sets the vCPU general purpose registers.
     ///
@@ -322,7 +299,7 @@ pub trait Vcpu: Send + Sync {
     ///
     /// X86 specific call to setup the CPUID registers.
     ///
-    fn set_cpuid2(&self, cpuid: &CpuId) -> Result<()>;
+    fn set_cpuid2(&self, cpuid: &[CpuIdEntry]) -> Result<()>;
     #[cfg(target_arch = "x86_64")]
     ///
     /// X86 specific call to enable HyperV SynIC
@@ -332,7 +309,7 @@ pub trait Vcpu: Send + Sync {
     ///
     /// X86 specific call to retrieve the CPUID registers.
     ///
-    fn get_cpuid2(&self, num_entries: usize) -> Result<CpuId>;
+    fn get_cpuid2(&self, num_entries: usize) -> Result<Vec<CpuIdEntry>>;
     #[cfg(target_arch = "x86_64")]
     ///
     /// Returns the state of the LAPIC (Local Advanced Programmable Interrupt Controller).
@@ -347,116 +324,65 @@ pub trait Vcpu: Send + Sync {
     ///
     /// Returns the model-specific registers (MSR) for this vCPU.
     ///
-    fn get_msrs(&self, msrs: &mut MsrEntries) -> Result<usize>;
+    fn get_msrs(&self, msrs: &mut Vec<MsrEntry>) -> Result<usize>;
     #[cfg(target_arch = "x86_64")]
     ///
     /// Setup the model-specific registers (MSR) for this vCPU.
     ///
-    fn set_msrs(&self, msrs: &MsrEntries) -> Result<usize>;
-    #[cfg(feature = "kvm")]
+    fn set_msrs(&self, msrs: &[MsrEntry]) -> Result<usize>;
     ///
     /// Returns the vcpu's current "multiprocessing state".
     ///
     fn get_mp_state(&self) -> Result<MpState>;
-    #[cfg(feature = "kvm")]
     ///
     /// Sets the vcpu's current "multiprocessing state".
     ///
     fn set_mp_state(&self, mp_state: MpState) -> Result<()>;
     #[cfg(target_arch = "x86_64")]
     ///
-    /// X86 specific call that returns the vcpu's current "xsave struct".
-    ///
-    fn get_xsave(&self) -> Result<Xsave>;
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// X86 specific call that sets the vcpu's current "xsave struct".
-    ///
-    fn set_xsave(&self, xsave: &Xsave) -> Result<()>;
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// X86 specific call that returns the vcpu's current "xcrs".
-    ///
-    fn get_xcrs(&self) -> Result<ExtendedControlRegisters>;
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// X86 specific call that sets the vcpu's current "xcrs".
-    ///
-    fn set_xcrs(&self, xcrs: &ExtendedControlRegisters) -> Result<()>;
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// Returns currently pending exceptions, interrupts, and NMIs as well as related
-    /// states of the vcpu.
-    ///
-    fn get_vcpu_events(&self) -> Result<VcpuEvents>;
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// Sets pending exceptions, interrupts, and NMIs as well as related states
-    /// of the vcpu.
-    ///
-    fn set_vcpu_events(&self, events: &VcpuEvents) -> Result<()>;
-    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-    ///
     /// Let the guest know that it has been paused, which prevents from
     /// potential soft lockups when being resumed.
     ///
-    fn notify_guest_clock_paused(&self) -> Result<()>;
-    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    fn notify_guest_clock_paused(&self) -> Result<()> {
+        Ok(())
+    }
     ///
     /// Sets debug registers to set hardware breakpoints and/or enable single step.
     ///
-    fn set_guest_debug(&self, addrs: &[GuestAddress], singlestep: bool) -> Result<()>;
+    fn set_guest_debug(&self, _addrs: &[GuestAddress], _singlestep: bool) -> Result<()> {
+        Err(HypervisorCpuError::SetDebugRegs(anyhow!("unimplemented")))
+    }
     ///
     /// Sets the type of CPU to be exposed to the guest and optional features.
     ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     fn vcpu_init(&self, kvi: &VcpuInit) -> Result<()>;
-    ///
-    /// Sets the value of one register for this vCPU.
-    ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-    fn set_reg(&self, reg_id: u64, data: u64) -> Result<()>;
-    ///
-    /// Sets the value of one register for this vCPU.
-    ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-    fn get_reg(&self, reg_id: u64) -> Result<u64>;
     ///
     /// Gets a list of the guest registers that are supported for the
     /// KVM_GET_ONE_REG/KVM_SET_ONE_REG calls.
     ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     fn get_reg_list(&self, reg_list: &mut RegList) -> Result<()>;
     ///
-    /// Save the state of the core registers.
+    /// Gets the value of a system register
     ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-    fn core_registers(&self, state: &mut StandardRegisters) -> Result<()>;
-    ///
-    /// Restore the state of the core registers.
-    ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-    fn set_core_registers(&self, state: &StandardRegisters) -> Result<()>;
-    ///
-    /// Save the state of the system registers.
-    ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-    fn system_registers(&self, state: &mut Vec<Register>) -> Result<()>;
-    ///
-    /// Restore the state of the system registers.
-    ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-    fn set_system_registers(&self, state: &[Register]) -> Result<()>;
-    ///
-    /// Read the MPIDR - Multiprocessor Affinity Register.
-    ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-    fn read_mpidr(&self) -> Result<u64>;
+    #[cfg(target_arch = "aarch64")]
+    fn get_sys_reg(&self, sys_reg: u32) -> Result<u64>;
     ///
     /// Configure core registers for a given CPU.
     ///
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[cfg(target_arch = "aarch64")]
     fn setup_regs(&self, cpu_id: u8, boot_ip: u64, fdt_start: u64) -> Result<()>;
+    ///
+    /// Check if the CPU supports PMU
+    ///
+    #[cfg(target_arch = "aarch64")]
+    fn has_pmu_support(&self) -> bool;
+    ///
+    /// Initialize PMU
+    ///
+    #[cfg(target_arch = "aarch64")]
+    fn init_pmu(&self, irq: u32) -> Result<()>;
     ///
     /// Retrieve the vCPU state.
     /// This function is necessary to snapshot the VM
@@ -480,25 +406,30 @@ pub trait Vcpu: Send + Sync {
     /// Initialize TDX support on the vCPU
     ///
     #[cfg(feature = "tdx")]
-    fn tdx_init(&self, hob_address: u64) -> Result<()>;
-    #[cfg(all(feature = "mshv", target_arch = "x86_64"))]
-    ///
-    /// Return suspend registers(explicit and intercept suspend registers)
-    ///
-    fn get_suspend_regs(&self) -> Result<SuspendRegisters>;
-    #[cfg(feature = "kvm")]
+    fn tdx_init(&self, _hob_address: u64) -> Result<()> {
+        unimplemented!()
+    }
     ///
     /// Set the "immediate_exit" state
     ///
-    fn set_immediate_exit(&self, exit: bool);
+    fn set_immediate_exit(&self, _exit: bool) {}
     #[cfg(feature = "tdx")]
     ///
     /// Returns the details about TDX exit reason
     ///
-    fn get_tdx_exit_details(&mut self) -> Result<TdxExitDetails>;
+    fn get_tdx_exit_details(&mut self) -> Result<TdxExitDetails> {
+        unimplemented!()
+    }
     #[cfg(feature = "tdx")]
     ///
     /// Set the status code for TDX exit
     ///
-    fn set_tdx_status(&mut self, status: TdxExitStatus);
+    fn set_tdx_status(&mut self, _status: TdxExitStatus) {
+        unimplemented!()
+    }
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Return the list of initial MSR entries for a VCPU
+    ///
+    fn boot_msr_entries(&self) -> Vec<MsrEntry>;
 }

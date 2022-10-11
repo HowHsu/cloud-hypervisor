@@ -12,10 +12,10 @@ use std::fmt::{self, Display};
 use std::mem;
 use std::result;
 use std::slice;
+use uuid::Uuid;
 use vm_memory::ByteValued;
 use vm_memory::{Address, Bytes, GuestAddress};
 
-#[allow(unused_variables)]
 #[derive(Debug)]
 pub enum Error {
     /// There was too little guest memory to store the entire SMBIOS table.
@@ -28,6 +28,8 @@ pub enum Error {
     WriteSmbiosEp,
     /// Failure to write additional data to memory
     WriteData,
+    /// Failure to parse uuid, uuid format may be error
+    ParseUuid(uuid::Error),
 }
 
 impl std::error::Error for Error {}
@@ -37,11 +39,16 @@ impl Display for Error {
         use self::Error::*;
 
         let description = match self {
-            NotEnoughMemory => "There was too little guest memory to store the SMBIOS table",
-            AddressOverflow => "The SMBIOS table has too little address space to be stored",
-            Clear => "Failure while zeroing out the memory for the SMBIOS table",
-            WriteSmbiosEp => "Failure to write SMBIOS entrypoint structure",
-            WriteData => "Failure to write additional data to memory",
+            NotEnoughMemory => {
+                "There was too little guest memory to store the SMBIOS table".to_string()
+            }
+            AddressOverflow => {
+                "The SMBIOS table has too little address space to be stored".to_string()
+            }
+            Clear => "Failure while zeroing out the memory for the SMBIOS table".to_string(),
+            WriteSmbiosEp => "Failure to write SMBIOS entrypoint structure".to_string(),
+            WriteData => "Failure to write additional data to memory".to_string(),
+            ParseUuid(e) => format!("Failure to parse uuid: {}", e),
         };
 
         write!(f, "SMBIOS error: {}", description)
@@ -54,6 +61,7 @@ pub type Result<T> = result::Result<T, Error>;
 const SM3_MAGIC_IDENT: &[u8; 5usize] = b"_SM3_";
 const BIOS_INFORMATION: u8 = 0;
 const SYSTEM_INFORMATION: u8 = 1;
+const OEM_STRINGS: u8 = 11;
 const END_OF_TABLE: u8 = 127;
 const PCI_SUPPORTED: u64 = 1 << 7;
 const IS_VIRTUAL_MACHINE: u8 = 1 << 4;
@@ -68,75 +76,81 @@ fn compute_checksum<T: Copy>(v: &T) -> u8 {
     (!checksum).wrapping_add(1)
 }
 
+#[repr(C)]
 #[repr(packed)]
-#[derive(Default, Copy)]
-pub struct Smbios30Entrypoint {
-    pub signature: [u8; 5usize],
-    pub checksum: u8,
-    pub length: u8,
-    pub majorver: u8,
-    pub minorver: u8,
-    pub docrev: u8,
-    pub revision: u8,
-    pub reserved: u8,
-    pub max_size: u32,
-    pub physptr: u64,
+#[derive(Default, Copy, Clone)]
+struct Smbios30Entrypoint {
+    signature: [u8; 5usize],
+    checksum: u8,
+    length: u8,
+    majorver: u8,
+    minorver: u8,
+    docrev: u8,
+    revision: u8,
+    reserved: u8,
+    max_size: u32,
+    physptr: u64,
 }
 
-impl Clone for Smbios30Entrypoint {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
+#[repr(C)]
 #[repr(packed)]
-#[derive(Default, Copy)]
-pub struct SmbiosBiosInfo {
-    pub typ: u8,
-    pub length: u8,
-    pub handle: u16,
-    pub vendor: u8,
-    pub version: u8,
-    pub start_addr: u16,
-    pub release_date: u8,
-    pub rom_size: u8,
-    pub characteristics: u64,
-    pub characteristics_ext1: u8,
-    pub characteristics_ext2: u8,
+#[derive(Default, Copy, Clone)]
+struct SmbiosBiosInfo {
+    r#type: u8,
+    length: u8,
+    handle: u16,
+    vendor: u8,
+    version: u8,
+    start_addr: u16,
+    release_date: u8,
+    rom_size: u8,
+    characteristics: u64,
+    characteristics_ext1: u8,
+    characteristics_ext2: u8,
 }
 
-impl Clone for SmbiosBiosInfo {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
+#[repr(C)]
 #[repr(packed)]
-#[derive(Default, Copy)]
-pub struct SmbiosSysInfo {
-    pub typ: u8,
-    pub length: u8,
-    pub handle: u16,
-    pub manufacturer: u8,
-    pub product_name: u8,
-    pub version: u8,
-    pub serial_number: u8,
-    pub uuid: [u8; 16usize],
-    pub wake_up_type: u8,
-    pub sku: u8,
-    pub family: u8,
+#[derive(Default, Copy, Clone)]
+struct SmbiosSysInfo {
+    r#type: u8,
+    length: u8,
+    handle: u16,
+    manufacturer: u8,
+    product_name: u8,
+    version: u8,
+    serial_number: u8,
+    uuid: [u8; 16usize],
+    wake_up_type: u8,
+    sku: u8,
+    family: u8,
 }
 
-impl Clone for SmbiosSysInfo {
-    fn clone(&self) -> Self {
-        *self
-    }
+#[repr(C)]
+#[repr(packed)]
+#[derive(Default, Copy, Clone)]
+struct SmbiosOemStrings {
+    r#type: u8,
+    length: u8,
+    handle: u16,
+    count: u8,
+}
+
+#[repr(C)]
+#[repr(packed)]
+#[derive(Default, Copy, Clone)]
+struct SmbiosEndOfTable {
+    r#type: u8,
+    length: u8,
+    handle: u16,
 }
 
 // SAFETY: These data structures only contain a series of integers
 unsafe impl ByteValued for Smbios30Entrypoint {}
 unsafe impl ByteValued for SmbiosBiosInfo {}
 unsafe impl ByteValued for SmbiosSysInfo {}
+unsafe impl ByteValued for SmbiosOemStrings {}
+unsafe impl ByteValued for SmbiosEndOfTable {}
 
 fn write_and_incr<T: ByteValued>(
     mem: &GuestMemoryMmap,
@@ -162,7 +176,12 @@ fn write_string(
     Ok(curptr)
 }
 
-pub fn setup_smbios(mem: &GuestMemoryMmap, serial_number: Option<&str>) -> Result<u64> {
+pub fn setup_smbios(
+    mem: &GuestMemoryMmap,
+    serial_number: Option<&str>,
+    uuid: Option<&str>,
+    oem_strings: Option<&[&str]>,
+) -> Result<u64> {
     let physptr = GuestAddress(SMBIOS_START)
         .checked_add(mem::size_of::<Smbios30Entrypoint>() as u64)
         .ok_or(Error::NotEnoughMemory)?;
@@ -172,7 +191,7 @@ pub fn setup_smbios(mem: &GuestMemoryMmap, serial_number: Option<&str>) -> Resul
     {
         handle += 1;
         let smbios_biosinfo = SmbiosBiosInfo {
-            typ: BIOS_INFORMATION,
+            r#type: BIOS_INFORMATION,
             length: mem::size_of::<SmbiosBiosInfo>() as u8,
             handle,
             vendor: 1,  // First string written in this section
@@ -189,13 +208,20 @@ pub fn setup_smbios(mem: &GuestMemoryMmap, serial_number: Option<&str>) -> Resul
 
     {
         handle += 1;
+
+        let uuid_number = uuid
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(Error::ParseUuid)?
+            .unwrap_or(Uuid::nil());
         let smbios_sysinfo = SmbiosSysInfo {
-            typ: SYSTEM_INFORMATION,
+            r#type: SYSTEM_INFORMATION,
             length: mem::size_of::<SmbiosSysInfo>() as u8,
             handle,
             manufacturer: 1, // First string written in this section
             product_name: 2, // Second string written in this section
             serial_number: serial_number.map(|_| 3).unwrap_or_default(), // 3rd string
+            uuid: uuid_number.to_bytes_le(), // set uuid
             ..Default::default()
         };
         curptr = write_and_incr(mem, smbios_sysinfo, curptr)?;
@@ -207,15 +233,34 @@ pub fn setup_smbios(mem: &GuestMemoryMmap, serial_number: Option<&str>) -> Resul
         curptr = write_and_incr(mem, 0u8, curptr)?;
     }
 
+    if let Some(oem_strings) = oem_strings {
+        handle += 1;
+
+        let smbios_oemstrings = SmbiosOemStrings {
+            r#type: OEM_STRINGS,
+            length: mem::size_of::<SmbiosOemStrings>() as u8,
+            handle,
+            count: oem_strings.len() as u8,
+        };
+
+        curptr = write_and_incr(mem, smbios_oemstrings, curptr)?;
+
+        for s in oem_strings {
+            curptr = write_string(mem, s, curptr)?;
+        }
+
+        curptr = write_and_incr(mem, 0u8, curptr)?;
+    }
+
     {
         handle += 1;
-        let smbios_sysinfo = SmbiosSysInfo {
-            typ: END_OF_TABLE,
-            length: mem::size_of::<SmbiosSysInfo>() as u8,
+        let smbios_end = SmbiosEndOfTable {
+            r#type: END_OF_TABLE,
+            length: mem::size_of::<SmbiosEndOfTable>() as u8,
             handle,
-            ..Default::default()
         };
-        curptr = write_and_incr(mem, smbios_sysinfo, curptr)?;
+        curptr = write_and_incr(mem, smbios_end, curptr)?;
+        curptr = write_and_incr(mem, 0u8, curptr)?;
         curptr = write_and_incr(mem, 0u8, curptr)?;
     }
 
@@ -237,7 +282,7 @@ pub fn setup_smbios(mem: &GuestMemoryMmap, serial_number: Option<&str>) -> Resul
             .map_err(|_| Error::WriteSmbiosEp)?;
     }
 
-    Ok(curptr.unchecked_offset_from(physptr))
+    Ok(curptr.unchecked_offset_from(physptr) + std::mem::size_of::<Smbios30Entrypoint>() as u64)
 }
 
 #[cfg(test)]
@@ -267,7 +312,7 @@ mod tests {
     fn entrypoint_checksum() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(SMBIOS_START), 4096)]).unwrap();
 
-        setup_smbios(&mem, None).unwrap();
+        setup_smbios(&mem, None, None, None).unwrap();
 
         let smbios_ep: Smbios30Entrypoint = mem.read_obj(GuestAddress(SMBIOS_START)).unwrap();
 

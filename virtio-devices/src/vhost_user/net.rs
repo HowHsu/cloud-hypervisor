@@ -24,10 +24,10 @@ use virtio_bindings::bindings::virtio_net::{
     VIRTIO_NET_F_CSUM, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_GUEST_ECN,
     VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6, VIRTIO_NET_F_GUEST_UFO,
     VIRTIO_NET_F_HOST_ECN, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_HOST_TSO6, VIRTIO_NET_F_HOST_UFO,
-    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF,
+    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU,
 };
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use virtio_queue::Queue;
+use virtio_queue::{Queue, QueueT};
 use vm_memory::{ByteValued, GuestMemoryAtomic};
 use vm_migration::{
     protocol::MemoryRangeTable, Migratable, MigratableError, Pausable, Snapshot, Snapshottable,
@@ -70,6 +70,7 @@ impl Net {
     pub fn new(
         id: String,
         mac_addr: MacAddr,
+        mtu: Option<u16>,
         vu_cfg: VhostUserConfig,
         server: bool,
         seccomp_action: SeccompAction,
@@ -126,8 +127,12 @@ impl Net {
             | 1 << VIRTIO_F_VERSION_1
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
 
+        if mtu.is_some() {
+            avail_features |= 1u64 << VIRTIO_NET_F_MTU;
+        }
+
         let mut config = VirtioNetConfig::default();
-        build_net_config_space(&mut config, mac_addr, num_queues, &mut avail_features);
+        build_net_config_space(&mut config, mac_addr, num_queues, mtu, &mut avail_features);
 
         let mut vu =
             VhostUserHandle::connect_vhost_user(server, &vu_cfg.socket, num_queues as u64, false)?;
@@ -272,24 +277,23 @@ impl VirtioDevice for Net {
         &mut self,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        mut queue_evts: Vec<EventFd>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         self.guest_memory = Some(mem.clone());
 
         let num_queues = queues.len();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
         if self.common.feature_acked(VIRTIO_NET_F_CTRL_VQ.into()) && num_queues % 2 != 0 {
             let ctrl_queue_index = num_queues - 1;
-            let mut ctrl_queue = queues.remove(ctrl_queue_index);
-            let ctrl_queue_evt = queue_evts.remove(ctrl_queue_index);
+            let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index);
 
             ctrl_queue.set_event_idx(event_idx);
 
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
             let mut ctrl_handler = NetCtrlEpollHandler {
+                mem: mem.clone(),
                 kill_evt,
                 pause_evt,
                 ctrl_q: CtrlQueue::new(Vec::new()),
@@ -314,11 +318,7 @@ impl VirtioDevice for Net {
                 Thread::VirtioVhostNetCtl,
                 &mut epoll_threads,
                 &self.exit_evt,
-                move || {
-                    if let Err(e) = ctrl_handler.run_ctrl(paused, paused_sync.unwrap()) {
-                        error!("Error running worker: {:?}", e);
-                    }
-                },
+                move || ctrl_handler.run_ctrl(paused, paused_sync.unwrap()),
             )?;
             self.ctrl_queue_epoll_thread = Some(epoll_threads.remove(0));
         }
@@ -336,7 +336,6 @@ impl VirtioDevice for Net {
         let mut handler = self.vu_common.activate(
             mem,
             queues,
-            queue_evts,
             interrupt_cb,
             backend_acked_features,
             slave_req_handler,
@@ -354,11 +353,7 @@ impl VirtioDevice for Net {
             Thread::VirtioVhostNet,
             &mut epoll_threads,
             &self.exit_evt,
-            move || {
-                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                    error!("Error running worker: {:?}", e);
-                }
-            },
+            move || handler.run(paused, paused_sync.unwrap()),
         )?;
         self.epoll_thread = Some(epoll_threads.remove(0));
 
@@ -372,11 +367,7 @@ impl VirtioDevice for Net {
         }
 
         if let Some(vu) = &self.vu_common.vu {
-            if let Err(e) = vu
-                .lock()
-                .unwrap()
-                .reset_vhost_user(self.common.queue_sizes.len())
-            {
+            if let Err(e) = vu.lock().unwrap().reset_vhost_user() {
                 error!("Failed to reset vhost-user daemon: {:?}", e);
                 return None;
             }

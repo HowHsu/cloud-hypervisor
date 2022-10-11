@@ -22,23 +22,23 @@ use crate::thread_helper::spawn_virtio_thread;
 use crate::{GuestMemoryMmap, GuestRegionMmap};
 use crate::{VirtioInterrupt, VirtioInterruptType};
 use anyhow::anyhow;
-use libc::EFD_NONBLOCK;
 use seccompiler::SeccompAction;
 use std::collections::BTreeMap;
 use std::io;
 use std::mem::size_of;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::result;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::sync::{Arc, Barrier, Mutex};
+use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use virtio_queue::{DescriptorChain, Queue};
+use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemoryAtomic, GuestMemoryError,
-    GuestMemoryLoadGuard, GuestMemoryRegion,
+    Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
+    GuestMemoryError, GuestMemoryLoadGuard, GuestMemoryRegion,
 };
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{
@@ -95,49 +95,47 @@ const VIRTIO_MEM_REQ_UNPLUG_ALL: u16 = 2;
 // request information about the plugged state of memory blocks
 const VIRTIO_MEM_REQ_STATE: u16 = 3;
 
-// Get resize event.
-const RESIZE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 // New descriptors are pending on the virtio queue.
-const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
+const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 
 // Virtio features
 const VIRTIO_MEM_F_ACPI_PXM: u8 = 0;
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    // Guest gave us bad memory addresses.
+    #[error("Guest gave us bad memory addresses: {0}")]
     GuestMemory(GuestMemoryError),
-    // Guest gave us a write only descriptor that protocol says to read from.
+    #[error("Guest gave us a write only descriptor that protocol says to read from.")]
     UnexpectedWriteOnlyDescriptor,
-    // Guest gave us a read only descriptor that protocol says to write to.
+    #[error("Guest gave us a read only descriptor that protocol says to write to.")]
     UnexpectedReadOnlyDescriptor,
-    // Guest gave us too few descriptors in a descriptor chain.
+    #[error("Guest gave us too few descriptors in a descriptor chain.")]
     DescriptorChainTooShort,
-    // Guest gave us a buffer that was too short to use.
+    #[error("Guest gave us a buffer that was too short to use.")]
     BufferLengthTooSmall,
-    // Guest sent us invalid request.
+    #[error("Guest sent us invalid request.")]
     InvalidRequest,
-    // Failed to EventFd write.
+    #[error("Failed to EventFd write: {0}")]
     EventFdWriteFail(std::io::Error),
-    // Failed to EventFd try_clone.
+    #[error("Failed to EventFd try_clone: {0}")]
     EventFdTryCloneFail(std::io::Error),
-    // Failed to MpscRecv.
+    #[error("Failed to MpscRecv: {0}")]
     MpscRecvFail(mpsc::RecvError),
-    // Resize invalid argument
+    #[error("Resize invalid argument: {0}")]
     ResizeError(anyhow::Error),
-    // Fail to resize trigger
+    #[error("Fail to resize trigger: {0}")]
     ResizeTriggerFail(DeviceError),
-    // Invalid configuration
+    #[error("Invalid configuration: {0}")]
     ValidateError(anyhow::Error),
-    // Failed discarding memory range
+    #[error("Failed discarding memory range: {0}")]
     DiscardMemoryRange(std::io::Error),
-    // Failed DMA mapping.
+    #[error("Failed DMA mapping: {0}")]
     DmaMap(std::io::Error),
-    // Failed DMA unmapping.
+    #[error("Failed DMA unmapping: {0}")]
     DmaUnmap(std::io::Error),
-    // Invalid DMA mapping handler
+    #[error("Invalid DMA mapping handler.")]
     InvalidDmaMappingHandler,
-    // Not activated by the guest
+    #[error("Not activated by the guest.")]
     NotActivatedByGuest,
 }
 
@@ -327,78 +325,6 @@ impl Request {
     }
 }
 
-pub struct ResizeSender {
-    hotplugged_size: Arc<AtomicU64>,
-    activated: Arc<AtomicBool>,
-    tx: mpsc::Sender<Result<(), Error>>,
-    evt: EventFd,
-}
-
-impl ResizeSender {
-    fn size(&self) -> u64 {
-        self.hotplugged_size.load(Ordering::Acquire)
-    }
-
-    fn send(&self, r: Result<(), Error>) -> Result<(), mpsc::SendError<Result<(), Error>>> {
-        self.tx.send(r)
-    }
-}
-
-impl Clone for ResizeSender {
-    fn clone(&self) -> Self {
-        ResizeSender {
-            hotplugged_size: self.hotplugged_size.clone(),
-            activated: self.activated.clone(),
-            tx: self.tx.clone(),
-            evt: self
-                .evt
-                .try_clone()
-                .expect("Failed cloning EventFd from ResizeSender"),
-        }
-    }
-}
-
-pub struct Resize {
-    hotplugged_size: Arc<AtomicU64>,
-    activated: Arc<AtomicBool>,
-    tx: mpsc::Sender<Result<(), Error>>,
-    rx: mpsc::Receiver<Result<(), Error>>,
-    evt: EventFd,
-}
-
-impl Resize {
-    pub fn new(hotplugged_size: u64) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
-
-        Ok(Resize {
-            hotplugged_size: Arc::new(AtomicU64::new(hotplugged_size)),
-            activated: Arc::new(AtomicBool::default()),
-            tx,
-            rx,
-            evt: EventFd::new(EFD_NONBLOCK)?,
-        })
-    }
-
-    pub fn new_resize_sender(&self) -> Result<ResizeSender, Error> {
-        Ok(ResizeSender {
-            hotplugged_size: self.hotplugged_size.clone(),
-            activated: self.activated.clone(),
-            tx: self.tx.clone(),
-            evt: self.evt.try_clone().map_err(Error::EventFdTryCloneFail)?,
-        })
-    }
-
-    pub fn work(&self, desired_size: u64) -> Result<(), Error> {
-        if !self.activated.load(Ordering::Acquire) {
-            return Err(Error::NotActivatedByGuest);
-        }
-
-        self.hotplugged_size.store(desired_size, Ordering::Release);
-        self.evt.write(1).map_err(Error::EventFdWriteFail)?;
-        self.rx.recv().map_err(Error::MpscRecvFail)?
-    }
-}
-
 #[derive(Clone, Versionize)]
 pub struct BlocksState {
     bitmap: Vec<bool>,
@@ -462,12 +388,12 @@ impl BlocksState {
 }
 
 struct MemEpollHandler {
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
     host_addr: u64,
     host_fd: Option<RawFd>,
     blocks_state: Arc<Mutex<BlocksState>>,
     config: Arc<Mutex<VirtioMemConfig>>,
-    resize: ResizeSender,
-    queue: Queue<GuestMemoryAtomic<GuestMemoryMmap>>,
+    queue: Queue,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     queue_evt: EventFd,
     kill_evt: EventFd,
@@ -663,19 +589,10 @@ impl MemEpollHandler {
     }
 
     fn process_queue(&mut self) -> bool {
-        let mut request_list = Vec::new();
-        let mut used_count = 0;
+        let mut used_descs = false;
 
-        for mut desc_chain in self.queue.iter().unwrap() {
-            request_list.push((
-                desc_chain.head_index(),
-                Request::parse(&mut desc_chain),
-                desc_chain.memory().clone(),
-            ));
-        }
-
-        for (head_index, request, memory) in request_list {
-            let len = match request {
+        while let Some(mut desc_chain) = self.queue.pop_descriptor_chain(self.mem.memory()) {
+            let len = match Request::parse(&mut desc_chain) {
                 Err(e) => {
                     error!("failed parse VirtioMemReq: {:?}", e);
                     0
@@ -684,21 +601,21 @@ impl MemEpollHandler {
                     VIRTIO_MEM_REQ_PLUG => {
                         let resp_type =
                             self.state_change_request(r.req.addr, r.req.nb_blocks, true);
-                        r.send_response(&memory, resp_type, 0u16)
+                        r.send_response(desc_chain.memory(), resp_type, 0u16)
                     }
                     VIRTIO_MEM_REQ_UNPLUG => {
                         let resp_type =
                             self.state_change_request(r.req.addr, r.req.nb_blocks, false);
-                        r.send_response(&memory, resp_type, 0u16)
+                        r.send_response(desc_chain.memory(), resp_type, 0u16)
                     }
                     VIRTIO_MEM_REQ_UNPLUG_ALL => {
                         let resp_type = self.unplug_all();
-                        r.send_response(&memory, resp_type, 0u16)
+                        r.send_response(desc_chain.memory(), resp_type, 0u16)
                     }
                     VIRTIO_MEM_REQ_STATE => {
                         let (resp_type, resp_state) =
                             self.state_request(r.req.addr, r.req.nb_blocks);
-                        r.send_response(&memory, resp_type, resp_state)
+                        r.send_response(desc_chain.memory(), resp_type, resp_state)
                     }
                     _ => {
                         error!("VirtioMemReq unknown request type {:?}", r.req.req_type);
@@ -707,11 +624,13 @@ impl MemEpollHandler {
                 },
             };
 
-            self.queue.add_used(head_index, len).unwrap();
-            used_count += 1;
+            self.queue
+                .add_used(desc_chain.memory(), desc_chain.head_index(), len)
+                .unwrap();
+            used_descs = true;
         }
 
-        used_count > 0
+        used_descs
     }
 
     fn run(
@@ -720,7 +639,6 @@ impl MemEpollHandler {
         paused_sync: Arc<Barrier>,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
-        helper.add_event(self.resize.evt.as_raw_fd(), RESIZE_EVENT)?;
         helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
         helper.run(paused, paused_sync, self)?;
 
@@ -729,54 +647,35 @@ impl MemEpollHandler {
 }
 
 impl EpollHelperHandler for MemEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
-            RESIZE_EVENT => {
-                if let Err(e) = self.resize.evt.read() {
-                    error!("Failed to get resize event: {:?}", e);
-                    return true;
-                } else {
-                    let size = self.resize.size();
-                    let mut config = self.config.lock().unwrap();
-                    let mut signal_error = false;
-                    let mut r = config.resize(size);
-                    r = match r {
-                        Err(e) => Err(e),
-                        _ => match self.signal(VirtioInterruptType::Config) {
-                            Err(e) => {
-                                signal_error = true;
-                                Err(Error::ResizeTriggerFail(e))
-                            }
-                            _ => Ok(()),
-                        },
-                    };
-                    if let Err(e) = self.resize.send(r) {
-                        error!("Sending \"resize\" response: {:?}", e);
-                        return true;
-                    }
-                    if signal_error {
-                        return true;
-                    }
-                }
-            }
             QUEUE_AVAIL_EVENT => {
-                if let Err(e) = self.queue_evt.read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                } else if self.process_queue() {
-                    if let Err(e) = self.signal(VirtioInterruptType::Queue(0)) {
-                        error!("Failed to signal used queue: {:?}", e);
-                        return true;
-                    }
+                self.queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
+
+                if self.process_queue() {
+                    self.signal(VirtioInterruptType::Queue(0)).map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             _ => {
-                error!("Unexpected event: {}", ev_type);
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unexpected event: {}",
+                    ev_type
+                )));
             }
         }
-        false
+        Ok(())
     }
 }
 
@@ -799,7 +698,6 @@ impl VersionMapped for MemState {}
 pub struct Mem {
     common: VirtioCommon,
     id: String,
-    resize: ResizeSender,
     host_addr: u64,
     host_fd: Option<RawFd>,
     config: Arc<Mutex<VirtioMemConfig>>,
@@ -808,6 +706,7 @@ pub struct Mem {
     dma_mapping_handlers: Arc<Mutex<BTreeMap<VirtioMemMappingSource, Arc<dyn ExternalDmaMapping>>>>,
     blocks_state: Arc<Mutex<BlocksState>>,
     exit_evt: EventFd,
+    interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
 }
 
 impl Mem {
@@ -816,7 +715,6 @@ impl Mem {
     pub fn new(
         id: String,
         region: &Arc<GuestRegionMmap>,
-        resize: ResizeSender,
         seccomp_action: SeccompAction,
         numa_node_id: Option<u16>,
         initial_size: u64,
@@ -888,7 +786,6 @@ impl Mem {
                 ..Default::default()
             },
             id,
-            resize,
             host_addr: region.as_ptr() as u64,
             host_fd,
             config: Arc::new(Mutex::new(config)),
@@ -897,7 +794,25 @@ impl Mem {
             dma_mapping_handlers: Arc::new(Mutex::new(BTreeMap::new())),
             blocks_state,
             exit_evt,
+            interrupt_cb: None,
         })
+    }
+
+    pub fn resize(&mut self, size: u64) -> result::Result<(), Error> {
+        let mut config = self.config.lock().unwrap();
+        config.resize(size).map_err(|e| {
+            Error::ResizeError(anyhow!("Failed to update virtio configuration: {:?}", e))
+        })?;
+
+        if let Some(interrupt_cb) = self.interrupt_cb.as_ref() {
+            interrupt_cb
+                .trigger(VirtioInterruptType::Config)
+                .map_err(|e| {
+                    Error::ResizeError(anyhow!("Failed to signal the guest about resize: {:?}", e))
+                })
+        } else {
+            Ok(())
+        }
     }
 
     pub fn add_dma_mapping_handler(
@@ -968,6 +883,11 @@ impl Mem {
         *(self.config.lock().unwrap()) = state.config;
         *(self.blocks_state.lock().unwrap()) = state.blocks_state.clone();
     }
+
+    #[cfg(fuzzing)]
+    pub fn wait_for_epoll_threads(&mut self) {
+        self.common.wait_for_epoll_threads();
+    }
 }
 
 impl Drop for Mem {
@@ -1002,22 +922,26 @@ impl VirtioDevice for Mem {
 
     fn activate(
         &mut self,
-        _mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        mut queue_evts: Vec<EventFd>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
+
+        let (_, queue, queue_evt) = queues.remove(0);
+
+        self.interrupt_cb = Some(interrupt_cb.clone());
+
         let mut handler = MemEpollHandler {
+            mem,
             host_addr: self.host_addr,
             host_fd: self.host_fd,
             blocks_state: Arc::clone(&self.blocks_state),
             config: self.config.clone(),
-            resize: self.resize.clone(),
-            queue: queues.remove(0),
+            queue,
             interrupt_cb,
-            queue_evt: queue_evts.remove(0),
+            queue_evt,
             kill_evt,
             pause_evt,
             hugepages: self.hugepages,
@@ -1049,22 +973,15 @@ impl VirtioDevice for Mem {
             Thread::VirtioMem,
             &mut epoll_threads,
             &self.exit_evt,
-            move || {
-                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                    error!("Error running worker: {:?}", e);
-                }
-            },
+            move || handler.run(paused, paused_sync.unwrap()),
         )?;
         self.common.epoll_threads = Some(epoll_threads);
-
-        self.resize.activated.store(true, Ordering::Release);
 
         event!("virtio-device", "activated", "id", &self.id);
         Ok(())
     }
 
     fn reset(&mut self) -> Option<Arc<dyn VirtioInterrupt>> {
-        self.resize.activated.store(false, Ordering::Release);
         let result = self.common.reset();
         event!("virtio-device", "reset", "id", &self.id);
         result

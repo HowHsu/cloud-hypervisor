@@ -13,27 +13,25 @@
 // limitations under the License.
 
 use crate::{
-    seccomp_filters::Thread, thread_helper::spawn_virtio_thread, ActivateError, ActivateResult,
-    EpollHelper, EpollHelperError, EpollHelperHandler, GuestMemoryMmap, VirtioCommon, VirtioDevice,
+    seccomp_filters::Thread, thread_helper::spawn_virtio_thread, ActivateResult, EpollHelper,
+    EpollHelperError, EpollHelperHandler, GuestMemoryMmap, VirtioCommon, VirtioDevice,
     VirtioDeviceType, VirtioInterrupt, VirtioInterruptType, EPOLL_HELPER_EVENT_LAST,
     VIRTIO_F_VERSION_1,
 };
-use libc::EFD_NONBLOCK;
+use anyhow::anyhow;
 use seccompiler::SeccompAction;
-use std::io;
+use std::io::{self, Write};
 use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::result;
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc, Barrier, Mutex,
-};
+use std::sync::{atomic::AtomicBool, Arc, Barrier};
+use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use virtio_queue::Queue;
+use virtio_queue::{Queue, QueueT};
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryAtomic, GuestMemoryError,
-    GuestMemoryRegion,
+    Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
+    GuestMemoryError, GuestMemoryRegion,
 };
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, VersionMapped,
@@ -44,14 +42,12 @@ const QUEUE_SIZE: u16 = 128;
 const REPORTING_QUEUE_SIZE: u16 = 32;
 const MIN_NUM_QUEUES: usize = 2;
 
-// Resize event.
-const RESIZE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 // Inflate virtio queue event.
-const INFLATE_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
+const INFLATE_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 // Deflate virtio queue event.
-const DEFLATE_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
+const DEFLATE_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 // Reporting virtio queue event.
-const REPORTING_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
+const REPORTING_QUEUE_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
 
 // Size of a PFN in the balloon interface.
 const VIRTIO_BALLOON_PFN_SHIFT: u64 = 12;
@@ -62,35 +58,29 @@ const VIRTIO_BALLOON_F_DEFLATE_ON_OOM: u64 = 2;
 // pages.
 const VIRTIO_BALLOON_F_REPORTING: u64 = 5;
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    // Guest gave us bad memory addresses.
+    #[error("Guest gave us bad memory addresses.: {0}")]
     GuestMemory(GuestMemoryError),
-    // Guest gave us a write only descriptor that protocol says to read from.
+    #[error("Guest gave us a write only descriptor that protocol says to read from.")]
     UnexpectedWriteOnlyDescriptor,
-    // Guest sent us invalid request.
+    #[error("Guest sent us invalid request.")]
     InvalidRequest,
-    // Fallocate fail.
+    #[error("Fallocate fail.: {0}")]
     FallocateFail(std::io::Error),
-    // Madvise fail.
+    #[error("Madvise fail.: {0}")]
     MadviseFail(std::io::Error),
-    // Failed to EventFd write.
+    #[error("Failed to EventFd write.: {0}")]
     EventFdWriteFail(std::io::Error),
-    // Failed to EventFd try_clone.
-    EventFdTryCloneFail(std::io::Error),
-    // Failed to MpscRecv.
-    MpscRecvFail(mpsc::RecvError),
-    // Resize invalid argument
-    ResizeInval(String),
-    // Invalid queue index
+    #[error("Invalid queue index: {0}")]
     InvalidQueueIndex(usize),
-    // Fail tp signal
+    #[error("Fail tp signal: {0}")]
     FailedSignal(io::Error),
-    /// Descriptor chain is too short
+    #[error("Descriptor chain is too short")]
     DescriptorChainTooShort,
-    /// Failed adding used index
+    #[error("Failed adding used index: {0}")]
     QueueAddUsed(virtio_queue::Error),
-    /// Failed creating an iterator over the queue
+    #[error("Failed creating an iterator over the queue: {0}")]
     QueueIterator(virtio_queue::Error),
 }
 
@@ -110,60 +100,9 @@ const CONFIG_ACTUAL_SIZE: usize = 4;
 // SAFETY: it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioBalloonConfig {}
 
-struct VirtioBalloonResizeReceiver {
-    size: Arc<AtomicU64>,
-    tx: mpsc::Sender<Result<(), Error>>,
-    evt: EventFd,
-}
-
-impl VirtioBalloonResizeReceiver {
-    fn get_size(&self) -> u64 {
-        self.size.load(Ordering::Acquire)
-    }
-
-    fn send(&self, r: Result<(), Error>) -> Result<(), mpsc::SendError<Result<(), Error>>> {
-        self.tx.send(r)
-    }
-}
-
-struct VirtioBalloonResize {
-    size: Arc<AtomicU64>,
-    tx: mpsc::Sender<Result<(), Error>>,
-    rx: mpsc::Receiver<Result<(), Error>>,
-    evt: EventFd,
-}
-
-impl VirtioBalloonResize {
-    pub fn new(size: u64) -> io::Result<Self> {
-        let (tx, rx) = mpsc::channel();
-
-        Ok(Self {
-            size: Arc::new(AtomicU64::new(size)),
-            tx,
-            rx,
-            evt: EventFd::new(EFD_NONBLOCK)?,
-        })
-    }
-
-    pub fn get_receiver(&self) -> Result<VirtioBalloonResizeReceiver, Error> {
-        Ok(VirtioBalloonResizeReceiver {
-            size: self.size.clone(),
-            tx: self.tx.clone(),
-            evt: self.evt.try_clone().map_err(Error::EventFdTryCloneFail)?,
-        })
-    }
-
-    pub fn work(&self, size: u64) -> Result<(), Error> {
-        self.size.store(size, Ordering::Release);
-        self.evt.write(1).map_err(Error::EventFdWriteFail)?;
-        self.rx.recv().map_err(Error::MpscRecvFail)?
-    }
-}
-
 struct BalloonEpollHandler {
-    config: Arc<Mutex<VirtioBalloonConfig>>,
-    resize_receiver: VirtioBalloonResizeReceiver,
-    queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    queues: Vec<Queue>,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     inflate_queue_evt: EventFd,
     deflate_queue_evt: EventFd,
@@ -225,33 +164,12 @@ impl BalloonEpollHandler {
         Self::advise_memory_range(memory, range_base, range_len, libc::MADV_DONTNEED)
     }
 
-    fn notify_queue(
-        &mut self,
-        queue_index: usize,
-        used_descs: Vec<(u16, u32)>,
-    ) -> result::Result<(), Error> {
-        for (desc_index, len) in used_descs.iter() {
-            self.queues[queue_index]
-                .add_used(*desc_index, *len)
-                .map_err(Error::QueueAddUsed)?;
-        }
-
-        if !used_descs.is_empty() {
-            self.signal(VirtioInterruptType::Queue(queue_index as u16))?;
-        }
-
-        Ok(())
-    }
-
     fn process_queue(&mut self, queue_index: usize) -> result::Result<(), Error> {
-        let mut used_descs = Vec::new();
-        for mut desc_chain in self.queues[queue_index]
-            .iter()
-            .map_err(Error::QueueIterator)?
+        let mut used_descs = false;
+        while let Some(mut desc_chain) =
+            self.queues[queue_index].pop_descriptor_chain(self.mem.memory())
         {
             let desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
-
-            used_descs.push((desc_chain.head_index(), desc.len()));
 
             let data_chunk_size = size_of::<u32>();
 
@@ -292,17 +210,24 @@ impl BalloonEpollHandler {
                     _ => return Err(Error::InvalidQueueIndex(queue_index)),
                 }
             }
+
+            self.queues[queue_index]
+                .add_used(desc_chain.memory(), desc_chain.head_index(), desc.len())
+                .map_err(Error::QueueAddUsed)?;
+            used_descs = true;
         }
 
-        self.notify_queue(queue_index, used_descs)
+        if used_descs {
+            self.signal(VirtioInterruptType::Queue(queue_index as u16))
+        } else {
+            Ok(())
+        }
     }
 
     fn process_reporting_queue(&mut self, queue_index: usize) -> result::Result<(), Error> {
-        let mut used_descs = Vec::new();
-
-        for mut desc_chain in self.queues[queue_index]
-            .iter()
-            .map_err(Error::QueueIterator)?
+        let mut used_descs = false;
+        while let Some(mut desc_chain) =
+            self.queues[queue_index].pop_descriptor_chain(self.mem.memory())
         {
             let mut descs_len = 0;
             while let Some(desc) = desc_chain.next() {
@@ -310,10 +235,17 @@ impl BalloonEpollHandler {
                 Self::release_memory_range(desc_chain.memory(), desc.addr(), desc.len() as usize)?;
             }
 
-            used_descs.push((desc_chain.head_index(), descs_len));
+            self.queues[queue_index]
+                .add_used(desc_chain.memory(), desc_chain.head_index(), descs_len)
+                .map_err(Error::QueueAddUsed)?;
+            used_descs = true;
         }
 
-        self.notify_queue(queue_index, used_descs)
+        if used_descs {
+            self.signal(VirtioInterruptType::Queue(queue_index as u16))
+        } else {
+            Ok(())
+        }
     }
 
     fn run(
@@ -322,7 +254,6 @@ impl BalloonEpollHandler {
         paused_sync: Arc<Barrier>,
     ) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
-        helper.add_event(self.resize_receiver.evt.as_raw_fd(), RESIZE_EVENT)?;
         helper.add_event(self.inflate_queue_evt.as_raw_fd(), INFLATE_QUEUE_EVENT)?;
         helper.add_event(self.deflate_queue_evt.as_raw_fd(), DEFLATE_QUEUE_EVENT)?;
         if let Some(reporting_queue_evt) = self.reporting_queue_evt.as_ref() {
@@ -335,77 +266,69 @@ impl BalloonEpollHandler {
 }
 
 impl EpollHelperHandler for BalloonEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
-            RESIZE_EVENT => {
-                if let Err(e) = self.resize_receiver.evt.read() {
-                    error!("Failed to get resize event: {:?}", e);
-                    return true;
-                }
-                let mut signal_error = false;
-                let r = {
-                    let mut config = self.config.lock().unwrap();
-                    config.num_pages =
-                        (self.resize_receiver.get_size() >> VIRTIO_BALLOON_PFN_SHIFT) as u32;
-                    if let Err(e) = self.signal(VirtioInterruptType::Config) {
-                        signal_error = true;
-                        Err(e)
-                    } else {
-                        Ok(())
-                    }
-                };
-                if let Err(e) = &r {
-                    // This error will send back to resize caller.
-                    error!("Handle resize event get error: {:?}", e);
-                }
-                if let Err(e) = self.resize_receiver.send(r) {
-                    error!("Sending \"resize\" generated error: {:?}", e);
-                    return true;
-                }
-                if signal_error {
-                    return true;
-                }
-            }
             INFLATE_QUEUE_EVENT => {
-                if let Err(e) = self.inflate_queue_evt.read() {
-                    error!("Failed to get inflate queue event: {:?}", e);
-                    return true;
-                } else if let Err(e) = self.process_queue(0) {
-                    error!("Failed to signal used inflate queue: {:?}", e);
-                    return true;
-                }
+                self.inflate_queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!(
+                        "Failed to get inflate queue event: {:?}",
+                        e
+                    ))
+                })?;
+                self.process_queue(0).map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!(
+                        "Failed to signal used inflate queue: {:?}",
+                        e
+                    ))
+                })?;
             }
             DEFLATE_QUEUE_EVENT => {
-                if let Err(e) = self.deflate_queue_evt.read() {
-                    error!("Failed to get deflate queue event: {:?}", e);
-                    return true;
-                } else if let Err(e) = self.process_queue(1) {
-                    error!("Failed to signal used deflate queue: {:?}", e);
-                    return true;
-                }
+                self.deflate_queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!(
+                        "Failed to get deflate queue event: {:?}",
+                        e
+                    ))
+                })?;
+                self.process_queue(1).map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!(
+                        "Failed to signal used deflate queue: {:?}",
+                        e
+                    ))
+                })?;
             }
             REPORTING_QUEUE_EVENT => {
                 if let Some(reporting_queue_evt) = self.reporting_queue_evt.as_ref() {
-                    if let Err(e) = reporting_queue_evt.read() {
-                        error!("Failed to get reporting queue event: {:?}", e);
-                        return true;
-                    } else if let Err(e) = self.process_reporting_queue(2) {
-                        error!("Failed to signal used inflate queue: {:?}", e);
-                        return true;
-                    }
+                    reporting_queue_evt.read().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to get reporting queue event: {:?}",
+                            e
+                        ))
+                    })?;
+                    self.process_reporting_queue(2).map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used inflate queue: {:?}",
+                            e
+                        ))
+                    })?;
                 } else {
-                    error!("Invalid reporting queue event as no eventfd registered");
-                    return true;
+                    return Err(EpollHelperError::HandleEvent(anyhow!(
+                        "Invalid reporting queue event as no eventfd registered"
+                    )));
                 }
             }
             _ => {
-                error!("Unknown event for virtio-balloon");
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unknown event for virtio-balloon"
+                )));
             }
         }
 
-        false
+        Ok(())
     }
 }
 
@@ -422,10 +345,10 @@ impl VersionMapped for BalloonState {}
 pub struct Balloon {
     common: VirtioCommon,
     id: String,
-    resize: VirtioBalloonResize,
-    config: Arc<Mutex<VirtioBalloonConfig>>,
+    config: VirtioBalloonConfig,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
+    interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
 }
 
 impl Balloon {
@@ -463,34 +386,47 @@ impl Balloon {
                 ..Default::default()
             },
             id,
-            resize: VirtioBalloonResize::new(size)?,
-            config: Arc::new(Mutex::new(config)),
+            config,
             seccomp_action,
             exit_evt,
+            interrupt_cb: None,
         })
     }
 
-    pub fn resize(&self, size: u64) -> Result<(), Error> {
-        self.resize.work(size)
+    pub fn resize(&mut self, size: u64) -> Result<(), Error> {
+        self.config.num_pages = (size >> VIRTIO_BALLOON_PFN_SHIFT) as u32;
+
+        if let Some(interrupt_cb) = &self.interrupt_cb {
+            interrupt_cb
+                .trigger(VirtioInterruptType::Config)
+                .map_err(Error::FailedSignal)
+        } else {
+            Ok(())
+        }
     }
 
     // Get the actual size of the virtio-balloon.
     pub fn get_actual(&self) -> u64 {
-        (self.config.lock().unwrap().actual as u64) << VIRTIO_BALLOON_PFN_SHIFT
+        (self.config.actual as u64) << VIRTIO_BALLOON_PFN_SHIFT
     }
 
     fn state(&self) -> BalloonState {
         BalloonState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            config: *(self.config.lock().unwrap()),
+            config: self.config,
         }
     }
 
     fn set_state(&mut self, state: &BalloonState) {
         self.common.avail_features = state.avail_features;
         self.common.acked_features = state.acked_features;
-        *(self.config.lock().unwrap()) = state.config;
+        self.config = state.config;
+    }
+
+    #[cfg(fuzzing)]
+    pub fn wait_for_epoll_threads(&mut self) {
+        self.common.wait_for_epoll_threads();
     }
 }
 
@@ -521,7 +457,7 @@ impl VirtioDevice for Balloon {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        self.read_config_from_slice(self.config.lock().unwrap().as_slice(), offset, data);
+        self.read_config_from_slice(self.config.as_slice(), offset, data);
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
@@ -535,35 +471,57 @@ impl VirtioDevice for Balloon {
             return;
         }
 
-        self.write_config_helper(self.config.lock().unwrap().as_mut_slice(), offset, data);
+        let config = self.config.as_mut_slice();
+        let config_len = config.len() as u64;
+        let data_len = data.len() as u64;
+        if offset + data_len > config_len {
+            error!(
+                    "Out-of-bound access to configuration: config_len = {} offset = {:x} length = {} for {}",
+                    config_len,
+                    offset,
+                    data_len,
+                    self.device_type()
+                );
+            return;
+        }
+
+        if let Some(end) = offset.checked_add(config.len() as u64) {
+            let mut offset_config =
+                &mut config[offset as usize..std::cmp::min(end, config_len) as usize];
+            offset_config.write_all(data).unwrap();
+        }
     }
 
     fn activate(
         &mut self,
-        _mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        mut queue_evts: Vec<EventFd>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
-        let inflate_queue_evt = queue_evts.remove(0);
-        let deflate_queue_evt = queue_evts.remove(0);
+        let mut virtqueues = Vec::new();
+        let (_, queue, queue_evt) = queues.remove(0);
+        virtqueues.push(queue);
+        let inflate_queue_evt = queue_evt;
+        let (_, queue, queue_evt) = queues.remove(0);
+        virtqueues.push(queue);
+        let deflate_queue_evt = queue_evt;
         let reporting_queue_evt =
-            if self.common.feature_acked(VIRTIO_BALLOON_F_REPORTING) && !queue_evts.is_empty() {
-                Some(queue_evts.remove(0))
+            if self.common.feature_acked(VIRTIO_BALLOON_F_REPORTING) && !queues.is_empty() {
+                let (_, queue, queue_evt) = queues.remove(0);
+                virtqueues.push(queue);
+                Some(queue_evt)
             } else {
                 None
             };
 
+        self.interrupt_cb = Some(interrupt_cb.clone());
+
         let mut handler = BalloonEpollHandler {
-            config: self.config.clone(),
-            resize_receiver: self.resize.get_receiver().map_err(|e| {
-                error!("failed to clone resize EventFd: {:?}", e);
-                ActivateError::BadActivate
-            })?,
-            queues,
+            mem,
+            queues: virtqueues,
             interrupt_cb,
             inflate_queue_evt,
             deflate_queue_evt,
@@ -582,11 +540,7 @@ impl VirtioDevice for Balloon {
             Thread::VirtioBalloon,
             &mut epoll_threads,
             &self.exit_evt,
-            move || {
-                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                    error!("Error running worker: {:?}", e);
-                }
-            },
+            move || handler.run(paused, paused_sync.unwrap()),
         )?;
         self.common.epoll_threads = Some(epoll_threads);
 

@@ -11,6 +11,7 @@ use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::GuestMemoryMmap;
 use crate::{DmaRemapping, VirtioInterrupt, VirtioInterruptType};
+use anyhow::anyhow;
 use seccompiler::SeccompAction;
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
@@ -23,11 +24,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, RwLock};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use virtio_queue::{DescriptorChain, Queue};
+use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemoryAtomic, GuestMemoryError,
-    GuestMemoryLoadGuard,
+    Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
+    GuestMemoryError, GuestMemoryLoadGuard,
 };
 use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
@@ -660,7 +661,8 @@ impl Request {
 }
 
 struct IommuEpollHandler {
-    queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    queues: Vec<Queue>,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     queue_evts: Vec<EventFd>,
     kill_evt: EventFd,
@@ -672,9 +674,8 @@ struct IommuEpollHandler {
 
 impl IommuEpollHandler {
     fn request_queue(&mut self) -> bool {
-        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        let mut used_count = 0;
-        for mut desc_chain in self.queues[0].iter().unwrap() {
+        let mut used_descs = false;
+        while let Some(mut desc_chain) = self.queues[0].pop_descriptor_chain(self.mem.memory()) {
             let len = match Request::parse(
                 &mut desc_chain,
                 &self.mapping,
@@ -688,14 +689,13 @@ impl IommuEpollHandler {
                 }
             };
 
-            used_desc_heads[used_count] = (desc_chain.head_index(), len);
-            used_count += 1;
+            self.queues[0]
+                .add_used(desc_chain.memory(), desc_chain.head_index(), len)
+                .unwrap();
+            used_descs = true;
         }
 
-        for &(desc_index, len) in &used_desc_heads[..used_count] {
-            self.queues[0].add_used(desc_index, len).unwrap();
-        }
-        used_count > 0
+        used_descs
     }
 
     fn event_queue(&mut self) -> bool {
@@ -726,37 +726,49 @@ impl IommuEpollHandler {
 }
 
 impl EpollHelperHandler for IommuEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
             REQUEST_Q_EVENT => {
-                if let Err(e) = self.queue_evts[0].read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                } else if self.request_queue() {
-                    if let Err(e) = self.signal_used_queue(0) {
-                        error!("Failed to signal used queue: {:?}", e);
-                        return true;
-                    }
+                self.queue_evts[0].read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
+
+                if self.request_queue() {
+                    self.signal_used_queue(0).map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             EVENT_Q_EVENT => {
-                if let Err(e) = self.queue_evts[1].read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                } else if self.event_queue() {
-                    if let Err(e) = self.signal_used_queue(1) {
-                        error!("Failed to signal used queue: {:?}", e);
-                        return true;
-                    }
+                self.queue_evts[1].read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
+
+                if self.event_queue() {
+                    self.signal_used_queue(1).map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             _ => {
-                error!("Unexpected event: {}", ev_type);
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unexpected event: {}",
+                    ev_type
+                )));
             }
         }
-        false
+        Ok(())
     }
 }
 
@@ -1050,15 +1062,23 @@ impl VirtioDevice for Iommu {
 
     fn activate(
         &mut self,
-        _mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        queue_evts: Vec<EventFd>,
+        queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
+
+        let mut virtqueues = Vec::new();
+        let mut queue_evts = Vec::new();
+        for (_, queue, queue_evt) in queues {
+            virtqueues.push(queue);
+            queue_evts.push(queue_evt);
+        }
+
         let mut handler = IommuEpollHandler {
-            queues,
+            mem,
+            queues: virtqueues,
             interrupt_cb,
             queue_evts,
             kill_evt,
@@ -1077,11 +1097,7 @@ impl VirtioDevice for Iommu {
             Thread::VirtioIommu,
             &mut epoll_threads,
             &self.exit_evt,
-            move || {
-                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                    error!("Error running worker: {:?}", e);
-                }
-            },
+            move || handler.run(paused, paused_sync.unwrap()),
         )?;
 
         self.common.epoll_threads = Some(epoll_threads);

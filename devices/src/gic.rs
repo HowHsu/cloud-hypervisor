@@ -6,14 +6,17 @@ use super::interrupt_controller::{Error, InterruptController};
 extern crate arch;
 use anyhow::anyhow;
 use arch::layout;
-use hypervisor::{arch::aarch64::gic::Vgic, CpuState};
+use hypervisor::{
+    arch::aarch64::gic::{Vgic, VgicConfig},
+    CpuState,
+};
 use std::result;
 use std::sync::{Arc, Mutex};
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptSourceConfig, InterruptSourceGroup,
     LegacyIrqSourceConfig, MsiIrqGroupConfig,
 };
-use vm_memory::Address;
+use vm_memory::address::Address;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
@@ -52,21 +55,28 @@ impl Gic {
         })
     }
 
+    /// Default config implied by arch::layout
+    pub fn create_default_config(vcpu_count: u64) -> VgicConfig {
+        let redists_size = layout::GIC_V3_REDIST_SIZE * vcpu_count;
+        let redists_addr = layout::GIC_V3_DIST_START.raw_value() - redists_size;
+        VgicConfig {
+            vcpu_count,
+            dist_addr: layout::GIC_V3_DIST_START.raw_value(),
+            dist_size: layout::GIC_V3_DIST_SIZE,
+            redists_addr,
+            redists_size,
+            msi_addr: redists_addr - layout::GIC_V3_ITS_SIZE,
+            msi_size: layout::GIC_V3_ITS_SIZE,
+            nr_irqs: layout::IRQ_NUM,
+        }
+    }
+
     pub fn create_vgic(
         &mut self,
         vm: &Arc<dyn hypervisor::Vm>,
-        vcpu_count: u64,
+        config: VgicConfig,
     ) -> Result<Arc<Mutex<dyn Vgic>>> {
-        let vgic = vm
-            .create_vgic(
-                vcpu_count,
-                layout::GIC_V3_DIST_START.raw_value(),
-                layout::GIC_V3_DIST_SIZE,
-                layout::GIC_V3_REDIST_SIZE,
-                layout::GIC_V3_ITS_SIZE,
-                layout::IRQ_NUM,
-            )
-            .map_err(Error::CreateGic)?;
+        let vgic = vm.create_vgic(config).map_err(Error::CreateGic)?;
         self.vgic = Some(vgic.clone());
         Ok(vgic.clone())
     }

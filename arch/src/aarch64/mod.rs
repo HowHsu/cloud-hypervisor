@@ -6,6 +6,8 @@
 pub mod fdt;
 /// Layout for this aarch64 system.
 pub mod layout;
+/// Module for system registers definition
+pub mod regs;
 /// Module for loading UEFI binary.
 pub mod uefi;
 
@@ -73,7 +75,9 @@ pub fn configure_vcpu(
         .map_err(Error::RegsConfiguration)?;
     }
 
-    let mpidr = vcpu.read_mpidr().map_err(Error::VcpuRegMpidr)?;
+    let mpidr = vcpu
+        .get_sys_reg(regs::MPIDR_EL1)
+        .map_err(Error::VcpuRegMpidr)?;
     Ok(mpidr)
 }
 

@@ -7,13 +7,12 @@
 // Copyright 2018-2019 CrowdStrike, Inc.
 //
 //
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86::CpuIdEntry;
 #[cfg(feature = "tdx")]
 use crate::kvm::TdxCapabilities;
 use crate::vm::Vm;
-#[cfg(target_arch = "x86_64")]
-use crate::x86_64::CpuId;
-#[cfg(target_arch = "x86_64")]
-use crate::x86_64::MsrList;
+use crate::HypervisorType;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -21,6 +20,11 @@ use thiserror::Error;
 ///
 ///
 pub enum HypervisorError {
+    ///
+    /// Hypervisor availability check error
+    ///
+    #[error("Failed to check availability of the hypervisor: {0}")]
+    HypervisorAvailableCheck(#[source] anyhow::Error),
     ///
     /// hypervisor creation error
     ///
@@ -85,6 +89,10 @@ pub type Result<T> = std::result::Result<T, HypervisorError>;
 ///
 pub trait Hypervisor: Send + Sync {
     ///
+    /// Returns the type of the hypervisor
+    ///
+    fn hypervisor_type(&self) -> HypervisorType;
+    ///
     /// Create a Vm using the underlying hypervisor
     /// Return a hypervisor-agnostic Vm trait object
     ///
@@ -100,26 +108,29 @@ pub trait Hypervisor: Send + Sync {
     ///
     /// Get the supported CpuID
     ///
-    fn get_cpuid(&self) -> Result<CpuId>;
+    fn get_cpuid(&self) -> Result<Vec<CpuIdEntry>>;
     ///
     /// Check particular extensions if any
     ///
     fn check_required_extensions(&self) -> Result<()> {
         Ok(())
     }
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// Retrieve the list of MSRs supported by the hypervisor.
-    ///
-    fn get_msr_list(&self) -> Result<MsrList>;
     #[cfg(target_arch = "aarch64")]
     ///
-    /// Retrieve AArch64 host maximum IPA size supported by KVM.
+    /// Retrieve AArch64 host maximum IPA size supported by KVM
     ///
     fn get_host_ipa_limit(&self) -> i32;
     ///
     /// Retrieve TDX capabilities
     ///
     #[cfg(feature = "tdx")]
-    fn tdx_capabilities(&self) -> Result<TdxCapabilities>;
+    fn tdx_capabilities(&self) -> Result<TdxCapabilities> {
+        unimplemented!()
+    }
+    ///
+    /// Get the number of supported hardware breakpoints
+    ///
+    fn get_guest_debug_hw_bps(&self) -> usize {
+        unimplemented!()
+    }
 }

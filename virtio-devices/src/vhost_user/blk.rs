@@ -292,10 +292,9 @@ impl VirtioDevice for Blk {
         &mut self,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        queue_evts: Vec<EventFd>,
+        queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         self.guest_memory = Some(mem.clone());
 
         let slave_req_handler: Option<MasterReqHandler<SlaveReqHandler>> = None;
@@ -307,7 +306,6 @@ impl VirtioDevice for Blk {
         let mut handler = self.vu_common.activate(
             mem,
             queues,
-            queue_evts,
             interrupt_cb,
             self.common.acked_features,
             slave_req_handler,
@@ -326,11 +324,7 @@ impl VirtioDevice for Blk {
             Thread::VirtioVhostBlock,
             &mut epoll_threads,
             &self.exit_evt,
-            move || {
-                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                    error!("Error running worker: {:?}", e);
-                }
-            },
+            move || handler.run(paused, paused_sync.unwrap()),
         )?;
         self.epoll_thread = Some(epoll_threads.remove(0));
 
@@ -344,11 +338,7 @@ impl VirtioDevice for Blk {
         }
 
         if let Some(vu) = &self.vu_common.vu {
-            if let Err(e) = vu
-                .lock()
-                .unwrap()
-                .reset_vhost_user(self.common.queue_sizes.len())
-            {
+            if let Err(e) = vu.lock().unwrap().reset_vhost_user() {
                 error!("Failed to reset vhost-user daemon: {:?}", e);
                 return None;
             }

@@ -24,6 +24,10 @@ use gdbstub::{
         Target, TargetError, TargetResult,
     },
 };
+#[cfg(target_arch = "aarch64")]
+use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
+#[cfg(target_arch = "aarch64")]
+use gdbstub_arch::aarch64::AArch64 as GdbArch;
 #[cfg(target_arch = "x86_64")]
 use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 #[cfg(target_arch = "x86_64")]
@@ -31,7 +35,6 @@ use gdbstub_arch::x86::X86_64_SSE as GdbArch;
 use std::{os::unix::net::UnixListener, sync::mpsc};
 use vm_memory::{GuestAddress, GuestMemoryError};
 
-#[cfg(target_arch = "x86_64")]
 type ArchUsize = u64;
 
 #[derive(Debug)]
@@ -121,7 +124,6 @@ pub struct GdbStub {
     gdb_sender: mpsc::Sender<GdbRequest>,
     gdb_event: vmm_sys_util::eventfd::EventFd,
     vm_event: vmm_sys_util::eventfd::EventFd,
-
     hw_breakpoints: Vec<GuestAddress>,
     single_step: bool,
 }
@@ -131,12 +133,13 @@ impl GdbStub {
         gdb_sender: mpsc::Sender<GdbRequest>,
         gdb_event: vmm_sys_util::eventfd::EventFd,
         vm_event: vmm_sys_util::eventfd::EventFd,
+        hw_breakpoints: usize,
     ) -> Self {
         Self {
             gdb_sender,
             gdb_event,
             vm_event,
-            hw_breakpoints: Default::default(),
+            hw_breakpoints: Vec::with_capacity(hw_breakpoints),
             single_step: false,
         }
     }
@@ -381,9 +384,12 @@ impl HwBreakpoint for GdbStub {
         addr: <Self::Arch as Arch>::Usize,
         _kind: <Self::Arch as Arch>::BreakpointKind,
     ) -> TargetResult<bool, Self> {
-        // If we already have 4 breakpoints, we cannot set a new one.
-        if self.hw_breakpoints.len() >= 4 {
-            error!("Not allowed to set more than 4 HW breakpoints");
+        // If the HW breakpoints reach the limit, no more can be added.
+        if self.hw_breakpoints.len() >= self.hw_breakpoints.capacity() {
+            error!(
+                "Not allowed to set more than {} HW breakpoints",
+                self.hw_breakpoints.capacity()
+            );
             return Ok(false);
         }
 

@@ -18,6 +18,7 @@ use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::GuestMemoryMmap;
 use crate::VirtioInterrupt;
+use anyhow::anyhow;
 use block_util::{
     async_io::AsyncIo, async_io::AsyncIoError, async_io::DiskFile, build_disk_image_id, Request,
     RequestType, VirtioBlockConfig,
@@ -26,17 +27,19 @@ use rate_limiter::{RateLimiter, TokenType};
 use seccompiler::SeccompAction;
 use std::io;
 use std::num::Wrapping;
+use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::result;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::{collections::HashMap, convert::TryInto};
+use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_bindings::bindings::virtio_blk::*;
-use virtio_queue::Queue;
-use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic};
+use virtio_queue::{Queue, QueueOwnedT, QueueT};
+use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryError};
 use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::AccessPlatform;
@@ -52,24 +55,26 @@ const COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 // New 'wake up' event from the rate limiter
 const RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    /// Failed to parse the request.
+    #[error("Failed to parse the request: {0}")]
     RequestParsing(block_util::Error),
-    /// Failed to execute the request.
+    #[error("Failed to execute the request: {0}")]
     RequestExecuting(block_util::ExecuteError),
-    /// Failed to complete the request.
+    #[error("Failed to complete the request: {0}")]
     RequestCompleting(block_util::Error),
-    /// Missing the expected entry in the list of requests.
+    #[error("Missing the expected entry in the list of requests")]
     MissingEntryRequestList,
-    /// The asynchronous request returned with failure.
+    #[error("The asynchronous request returned with failure")]
     AsyncRequestFailure,
-    /// Failed synchronizing the file
+    #[error("Failed synchronizing the file: {0}")]
     Fsync(AsyncIoError),
-    /// Failed adding used index
+    #[error("Failed adding used index: {0}")]
     QueueAddUsed(virtio_queue::Error),
-    /// Failed creating an iterator over the queue
+    #[error("Failed creating an iterator over the queue: {0}")]
     QueueIterator(virtio_queue::Error),
+    #[error("Failed to update request status: {0}")]
+    RequestStatus(GuestMemoryError),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -84,7 +89,7 @@ pub struct BlockCounters {
 
 struct BlockEpollHandler {
     queue_index: u16,
-    queue: Queue<GuestMemoryAtomic<GuestMemoryMmap>>,
+    queue: Queue,
     mem: GuestMemoryAtomic<GuestMemoryMmap>,
     disk_image: Box<dyn AsyncIo>,
     disk_nsectors: u64,
@@ -104,11 +109,9 @@ impl BlockEpollHandler {
     fn process_queue_submit(&mut self) -> Result<bool> {
         let queue = &mut self.queue;
 
-        let mut used_desc_heads = Vec::new();
-        let mut used_count = 0;
+        let mut used_descs = false;
 
-        let mut avail_iter = queue.iter().map_err(Error::QueueIterator)?;
-        for mut desc_chain in &mut avail_iter {
+        while let Some(mut desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) {
             let mut request = Request::parse(&mut desc_chain, self.access_platform.as_ref())
                 .map_err(Error::RequestParsing)?;
 
@@ -118,7 +121,7 @@ impl BlockEpollHandler {
                 if !rate_limiter.consume(1, TokenType::Ops) {
                     // Stop processing the queue and return this descriptor chain to the
                     // avail ring, for later processing.
-                    avail_iter.go_to_previous_position();
+                    queue.go_to_previous_position();
                     break;
                 }
                 // Exercise the rate limiter only if this request is of data transfer type.
@@ -137,7 +140,7 @@ impl BlockEpollHandler {
                         rate_limiter.manual_replenish(1, TokenType::Ops);
                         // Stop processing the queue and return this descriptor chain to the
                         // avail ring, for later processing.
-                        avail_iter.go_to_previous_position();
+                        queue.go_to_previous_position();
                         break;
                     }
                 };
@@ -157,34 +160,27 @@ impl BlockEpollHandler {
             {
                 self.request_list.insert(desc_chain.head_index(), request);
             } else {
-                // We use unwrap because the request parsing process already
-                // checked that the status_addr was valid.
                 desc_chain
                     .memory()
                     .write_obj(VIRTIO_BLK_S_OK, request.status_addr)
-                    .unwrap();
+                    .map_err(Error::RequestStatus)?;
 
                 // If no asynchronous operation has been submitted, we can
                 // simply return the used descriptor.
-                used_desc_heads.push((desc_chain.head_index(), 0));
-                used_count += 1;
+                queue
+                    .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                    .map_err(Error::QueueAddUsed)?;
+                used_descs = true;
             }
         }
 
-        for &(desc_index, len) in used_desc_heads.iter() {
-            queue
-                .add_used(desc_index, len)
-                .map_err(Error::QueueAddUsed)?;
-        }
-
-        Ok(used_count > 0)
+        Ok(used_descs)
     }
 
     fn process_queue_complete(&mut self) -> Result<bool> {
         let queue = &mut self.queue;
 
-        let mut used_desc_heads = Vec::new();
-        let mut used_count = 0;
+        let mut used_descs = false;
         let mem = self.mem.memory();
         let mut read_bytes = Wrapping(0);
         let mut write_bytes = Wrapping(0);
@@ -229,18 +225,13 @@ impl BlockEpollHandler {
                 return Err(Error::AsyncRequestFailure);
             };
 
-            // We use unwrap because the request parsing process already
-            // checked that the status_addr was valid.
-            mem.write_obj(status, request.status_addr).unwrap();
+            mem.write_obj(status, request.status_addr)
+                .map_err(Error::RequestStatus)?;
 
-            used_desc_heads.push((desc_index as u16, len));
-            used_count += 1;
-        }
-
-        for &(desc_index, len) in used_desc_heads.iter() {
             queue
-                .add_used(desc_index, len)
+                .add_used(mem.deref(), desc_index as u16, len)
                 .map_err(Error::QueueAddUsed)?;
+            used_descs = true;
         }
 
         self.counters
@@ -257,7 +248,7 @@ impl BlockEpollHandler {
             .read_ops
             .fetch_add(read_ops.0, Ordering::AcqRel);
 
-        Ok(used_count > 0)
+        Ok(used_descs)
     }
 
     fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
@@ -287,88 +278,101 @@ impl BlockEpollHandler {
 }
 
 impl EpollHelperHandler for BlockEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
             QUEUE_AVAIL_EVENT => {
-                if let Err(e) = self.queue_evt.read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                }
+                self.queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
 
                 let rate_limit_reached =
                     self.rate_limiter.as_ref().map_or(false, |r| r.is_blocked());
 
                 // Process the queue only when the rate limit is not reached
                 if !rate_limit_reached {
-                    match self.process_queue_submit() {
-                        Ok(needs_notification) => {
-                            if needs_notification {
-                                if let Err(e) = self.signal_used_queue() {
-                                    error!("Failed to signal used queue: {:?}", e);
-                                    return true;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to process queue (submit): {:?}", e);
-                            return true;
-                        }
-                    }
+                    let needs_notification = self.process_queue_submit().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process queue (submit): {:?}",
+                            e
+                        ))
+                    })?;
+
+                    if needs_notification {
+                        self.signal_used_queue().map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!(
+                                "Failed to signal used queue: {:?}",
+                                e
+                            ))
+                        })?
+                    };
                 }
             }
             COMPLETION_EVENT => {
-                if let Err(e) = self.disk_image.notifier().read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                }
+                self.disk_image.notifier().read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
 
-                match self.process_queue_complete() {
-                    Ok(needs_notification) => {
-                        if needs_notification {
-                            if let Err(e) = self.signal_used_queue() {
-                                error!("Failed to signal used queue: {:?}", e);
-                                return true;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to process queue (complete): {:?}", e);
-                        return true;
-                    }
+                let needs_notification = self.process_queue_complete().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!(
+                        "Failed to process queue (complete): {:?}",
+                        e
+                    ))
+                })?;
+
+                if needs_notification {
+                    self.signal_used_queue().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             RATE_LIMITER_EVENT => {
                 if let Some(rate_limiter) = &mut self.rate_limiter {
                     // Upon rate limiter event, call the rate limiter handler
                     // and restart processing the queue.
-                    if rate_limiter.event_handler().is_ok() {
-                        match self.process_queue_submit() {
-                            Ok(needs_notification) => {
-                                if needs_notification {
-                                    if let Err(e) = self.signal_used_queue() {
-                                        error!("Failed to signal used queue: {:?}", e);
-                                        return true;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to process queue (submit): {:?}", e);
-                                return true;
-                            }
-                        }
-                    }
+                    rate_limiter.event_handler().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process rate limiter event: {:?}",
+                            e
+                        ))
+                    })?;
+
+                    let needs_notification = self.process_queue_submit().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process queue (submit): {:?}",
+                            e
+                        ))
+                    })?;
+
+                    if needs_notification {
+                        self.signal_used_queue().map_err(|e| {
+                            EpollHelperError::HandleEvent(anyhow!(
+                                "Failed to signal used queue: {:?}",
+                                e
+                            ))
+                        })?
+                    };
                 } else {
-                    error!("Unexpected 'RATE_LIMITER_EVENT' when rate_limiter is not enabled.");
-                    return true;
+                    return Err(EpollHelperError::HandleEvent(anyhow!(
+                        "Unexpected 'RATE_LIMITER_EVENT' when rate_limiter is not enabled."
+                    )));
                 }
             }
             _ => {
-                error!("Unexpected event: {}", ev_type);
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unexpected event: {}",
+                    ev_type
+                )));
             }
         }
-        false
+        Ok(())
     }
 }
 
@@ -533,6 +537,11 @@ impl Block {
         );
         self.writeback.store(writeback, Ordering::Release);
     }
+
+    #[cfg(fuzzing)]
+    pub fn wait_for_epoll_threads(&mut self) {
+        self.common.wait_for_epoll_threads();
+    }
 }
 
 impl Drop for Block {
@@ -587,19 +596,17 @@ impl VirtioDevice for Block {
         &mut self,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        mut queue_evts: Vec<EventFd>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
 
         let disk_image_id = build_disk_image_id(&self.disk_path);
         self.update_writeback();
 
         let mut epoll_threads = Vec::new();
         for i in 0..queues.len() {
-            let queue_evt = queue_evts.remove(0);
-            let queue = queues.remove(0);
-            let queue_size = queue.state.size;
+            let (_, queue, queue_evt) = queues.remove(0);
+            let queue_size = queue.size();
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
             let rate_limiter: Option<RateLimiter> = self
@@ -641,11 +648,7 @@ impl VirtioDevice for Block {
                 Thread::VirtioBlock,
                 &mut epoll_threads,
                 &self.exit_evt,
-                move || {
-                    if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                        error!("Error running worker: {:?}", e);
-                    }
-                },
+                move || handler.run(paused, paused_sync.unwrap()),
             )?;
         }
 

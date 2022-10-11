@@ -16,8 +16,9 @@ use net_util::{
 use option_parser::Toggle;
 use option_parser::{OptionParser, OptionParserError};
 use std::fmt;
-use std::io::{self};
+use std::io;
 use std::net::Ipv4Addr;
+use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process;
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,6 +27,7 @@ use vhost::vhost_user::message::*;
 use vhost::vhost_user::Listener;
 use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
 use virtio_bindings::bindings::virtio_net::*;
+use vm_memory::GuestAddressSpace;
 use vm_memory::{bitmap::AtomicBitmap, GuestMemoryAtomic};
 use vmm_sys_util::{epoll::EventSet, eventfd::EventFd};
 
@@ -113,22 +115,27 @@ pub struct VhostUserNetBackend {
     num_queues: usize,
     queue_size: u16,
     queues_per_thread: Vec<u64>,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
 }
 
 impl VhostUserNetBackend {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ip_addr: Ipv4Addr,
         host_mac: MacAddr,
         netmask: Ipv4Addr,
+        mtu: Option<u16>,
         num_queues: usize,
         queue_size: u16,
         ifname: Option<&str>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
     ) -> Result<Self> {
         let mut taps = open_tap(
             ifname,
             Some(ip_addr),
             Some(netmask),
             &mut Some(host_mac),
+            mtu,
             num_queues / 2,
             None,
         )
@@ -147,6 +154,7 @@ impl VhostUserNetBackend {
             num_queues,
             queue_size,
             queues_per_thread,
+            mem,
         })
     }
 }
@@ -176,6 +184,7 @@ impl VhostUserBackendMut<VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>, Atomic
             | 1 << VIRTIO_NET_F_CTRL_VQ
             | 1 << VIRTIO_NET_F_MQ
             | 1 << VIRTIO_NET_F_MAC
+            | 1 << VIRTIO_NET_F_MTU
             | 1 << VIRTIO_F_NOTIFY_ON_EMPTY
             | 1 << VIRTIO_F_VERSION_1
             | VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits()
@@ -214,7 +223,7 @@ impl VhostUserBackendMut<VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>, Atomic
                 let mut vring = vrings[1].get_mut();
                 if thread
                     .net
-                    .process_tx(vring.get_queue_mut())
+                    .process_tx(self.mem.memory().deref(), vring.get_queue_mut())
                     .map_err(Error::NetQueuePair)?
                 {
                     vring
@@ -226,7 +235,7 @@ impl VhostUserBackendMut<VringRwLock<GuestMemoryAtomic<GuestMemoryMmap>>, Atomic
                 let mut vring = vrings[0].get_mut();
                 if thread
                     .net
-                    .process_rx(vring.get_queue_mut())
+                    .process_rx(self.mem.memory().deref(), vring.get_queue_mut())
                     .map_err(Error::NetQueuePair)?
                 {
                     vring
@@ -267,6 +276,7 @@ pub struct VhostUserNetBackendConfig {
     pub ip: Ipv4Addr,
     pub host_mac: MacAddr,
     pub mask: Ipv4Addr,
+    pub mtu: Option<u16>,
     pub socket: String,
     pub num_queues: usize,
     pub queue_size: u16,
@@ -283,6 +293,7 @@ impl VhostUserNetBackendConfig {
             .add("ip")
             .add("host_mac")
             .add("mask")
+            .add("mtu")
             .add("queue_size")
             .add("num_queues")
             .add("socket")
@@ -303,6 +314,7 @@ impl VhostUserNetBackendConfig {
             .convert("mask")
             .map_err(Error::FailedConfigParse)?
             .unwrap_or_else(|| Ipv4Addr::new(255, 255, 255, 0));
+        let mtu = parser.convert("mtu").map_err(Error::FailedConfigParse)?;
         let queue_size = parser
             .convert("queue_size")
             .map_err(Error::FailedConfigParse)?
@@ -322,6 +334,7 @@ impl VhostUserNetBackendConfig {
             ip,
             host_mac,
             mask,
+            mtu,
             socket,
             num_queues,
             queue_size,
@@ -342,14 +355,18 @@ pub fn start_net_backend(backend_command: &str) {
 
     let tap = backend_config.tap.as_deref();
 
+    let mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
+
     let net_backend = Arc::new(RwLock::new(
         VhostUserNetBackend::new(
             backend_config.ip,
             backend_config.host_mac,
             backend_config.mask,
+            backend_config.mtu,
             backend_config.num_queues,
             backend_config.queue_size,
             tap,
+            mem.clone(),
         )
         .unwrap(),
     ));
@@ -357,7 +374,7 @@ pub fn start_net_backend(backend_command: &str) {
     let mut net_daemon = VhostUserDaemon::new(
         "vhost-user-net-backend".to_string(),
         net_backend.clone(),
-        GuestMemoryAtomic::new(GuestMemoryMmap::new()),
+        mem,
     )
     .unwrap();
 

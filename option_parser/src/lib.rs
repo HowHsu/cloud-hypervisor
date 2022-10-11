@@ -31,34 +31,48 @@ impl fmt::Display for OptionParserError {
             OptionParserError::UnknownOption(s) => write!(f, "unknown option: {}", s),
             OptionParserError::InvalidSyntax(s) => write!(f, "invalid syntax:{}", s),
             OptionParserError::Conversion(field, value) => {
-                write!(f, "unable to parse {} for {}", value, field)
+                write!(f, "unable to convert {} for {}", value, field)
             }
         }
     }
 }
 type OptionParserResult<T> = std::result::Result<T, OptionParserError>;
 
-fn split_commas_outside_brackets(s: &str) -> OptionParserResult<Vec<String>> {
+fn split_commas(s: &str) -> OptionParserResult<Vec<String>> {
     let mut list: Vec<String> = Vec::new();
-    let mut opened_brackets: usize = 0;
-    for element in s.trim().split(',') {
-        if opened_brackets > 0 {
-            if let Some(last) = list.last_mut() {
-                *last = format!("{},{}", last, element);
-            } else {
-                return Err(OptionParserError::InvalidSyntax(s.to_owned()));
-            }
-        } else {
-            list.push(element.to_string());
-        }
+    let mut opened_brackets = 0;
+    let mut in_quotes = false;
+    let mut current = String::new();
 
-        opened_brackets += element.matches('[').count();
-        let closing_brackets = element.matches(']').count();
-        if closing_brackets > opened_brackets {
-            return Err(OptionParserError::InvalidSyntax(s.to_owned()));
-        } else {
-            opened_brackets -= closing_brackets;
+    for c in s.trim().chars() {
+        match c {
+            '[' => {
+                opened_brackets += 1;
+                current.push('[');
+            }
+            ']' => {
+                opened_brackets -= 1;
+                if opened_brackets < 0 {
+                    return Err(OptionParserError::InvalidSyntax(s.to_owned()));
+                }
+                current.push(']');
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' => {
+                if opened_brackets > 0 || in_quotes {
+                    current.push(',')
+                } else {
+                    list.push(current);
+                    current = String::new();
+                }
+            }
+            c => current.push(c),
         }
+    }
+    list.push(current);
+
+    if opened_brackets != 0 || in_quotes {
+        return Err(OptionParserError::InvalidSyntax(s.to_owned()));
     }
 
     Ok(list)
@@ -76,7 +90,7 @@ impl OptionParser {
             return Ok(());
         }
 
-        for option in split_commas_outside_brackets(input)?.iter() {
+        for option in split_commas(input)?.iter() {
             let parts: Vec<&str> = option.splitn(2, '=').collect();
 
             match self.options.get_mut(parts[0]) {
@@ -291,9 +305,13 @@ impl<S: FromStr, T: TupleValue> FromStr for Tuple<S, T> {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let mut list: Vec<(S, T)> = Vec::new();
 
-        let tuples_list =
-            split_commas_outside_brackets(s.trim().trim_matches(|c| c == '[' || c == ']'))
-                .map_err(TupleError::SplitOutsideBrackets)?;
+        let body = s
+            .trim()
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .ok_or_else(|| TupleError::InvalidValue(s.to_string()))?;
+
+        let tuples_list = split_commas(body).map_err(TupleError::SplitOutsideBrackets)?;
         for tuple in tuples_list.iter() {
             let items: Vec<&str> = tuple.split('@').collect();
 
@@ -332,5 +350,60 @@ impl FromStr for StringList {
             .collect();
 
         Ok(StringList(string_list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_option_parser() {
+        let mut parser = OptionParser::new();
+        parser
+            .add("size")
+            .add("mergeable")
+            .add("hotplug_method")
+            .add("hotplug_size")
+            .add("topology")
+            .add("cmdline");
+
+        assert!(parser.parse("size=128M,hanging_param").is_err());
+        assert!(parser.parse("size=128M,too_many_equals=foo=bar").is_err());
+        assert!(parser.parse("size=128M,file=/dev/shm").is_err());
+
+        assert!(parser.parse("size=128M").is_ok());
+        assert_eq!(parser.get("size"), Some("128M".to_owned()));
+        assert!(!parser.is_set("mergeable"));
+        assert!(parser.is_set("size"));
+
+        assert!(parser.parse("size=128M,mergeable=on").is_ok());
+        assert_eq!(parser.get("size"), Some("128M".to_owned()));
+        assert_eq!(parser.get("mergeable"), Some("on".to_owned()));
+
+        assert!(parser
+            .parse("size=128M,mergeable=on,topology=[1,2]")
+            .is_ok());
+        assert_eq!(parser.get("size"), Some("128M".to_owned()));
+        assert_eq!(parser.get("mergeable"), Some("on".to_owned()));
+        assert_eq!(parser.get("topology"), Some("[1,2]".to_owned()));
+
+        assert!(parser
+            .parse("size=128M,mergeable=on,topology=[[1,2],[3,4]]")
+            .is_ok());
+        assert_eq!(parser.get("size"), Some("128M".to_owned()));
+        assert_eq!(parser.get("mergeable"), Some("on".to_owned()));
+        assert_eq!(parser.get("topology"), Some("[[1,2],[3,4]]".to_owned()));
+
+        assert!(parser.parse("topology=[").is_err());
+        assert!(parser.parse("topology=[[[]]]]").is_err());
+
+        assert!(parser.parse("cmdline=\"console=ttyS0,9600n8\"").is_ok());
+        assert_eq!(
+            parser.get("cmdline"),
+            Some("console=ttyS0,9600n8".to_owned())
+        );
+        assert!(parser.parse("cmdline=\"").is_err());
+        assert!(parser.parse("cmdline=\"\"\"").is_err());
     }
 }

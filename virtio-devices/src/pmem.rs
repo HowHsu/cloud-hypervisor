@@ -16,8 +16,8 @@ use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::{GuestMemoryMmap, MmapRegion};
 use crate::{VirtioInterrupt, VirtioInterruptType};
+use anyhow::anyhow;
 use seccompiler::SeccompAction;
-use std::fmt::{self, Display};
 use std::fs::File;
 use std::io;
 use std::mem::size_of;
@@ -25,12 +25,13 @@ use std::os::unix::io::AsRawFd;
 use std::result;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier};
+use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use virtio_queue::{DescriptorChain, Queue};
+use virtio_queue::{DescriptorChain, Queue, QueueT};
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemoryAtomic, GuestMemoryError,
-    GuestMemoryLoadGuard,
+    Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
+    GuestMemoryError, GuestMemoryLoadGuard,
 };
 use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
@@ -75,35 +76,22 @@ struct VirtioPmemResp {
 // SAFETY: it only has data and has no implicit padding.
 unsafe impl ByteValued for VirtioPmemResp {}
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 enum Error {
-    /// Guest gave us bad memory addresses.
+    #[error("Bad guest memory addresses: {0}")]
     GuestMemory(GuestMemoryError),
-    /// Guest gave us a write only descriptor that protocol says to read from.
+    #[error("Unexpected write-only descriptor")]
     UnexpectedWriteOnlyDescriptor,
-    /// Guest gave us a read only descriptor that protocol says to write to.
+    #[error("Unexpected read-only descriptor")]
     UnexpectedReadOnlyDescriptor,
-    /// Guest gave us too few descriptors in a descriptor chain.
+    #[error("Descriptor chain too short")]
     DescriptorChainTooShort,
-    /// Guest gave us a buffer that was too short to use.
+    #[error("Buffer length too small")]
     BufferLengthTooSmall,
-    /// Guest sent us invalid request.
+    #[error("Invalid request")]
     InvalidRequest,
-}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use self::Error::*;
-
-        match self {
-            BufferLengthTooSmall => write!(f, "buffer length too small"),
-            DescriptorChainTooShort => write!(f, "descriptor chain too short"),
-            GuestMemory(e) => write!(f, "bad guest memory address: {}", e),
-            InvalidRequest => write!(f, "invalid request"),
-            UnexpectedReadOnlyDescriptor => write!(f, "unexpected read-only descriptor"),
-            UnexpectedWriteOnlyDescriptor => write!(f, "unexpected write-only descriptor"),
-        }
-    }
+    #[error("Failed adding used index: {0}")]
+    QueueAddUsed(virtio_queue::Error),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -165,7 +153,8 @@ impl Request {
 }
 
 struct PmemEpollHandler {
-    queue: Queue<GuestMemoryAtomic<GuestMemoryMmap>>,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    queue: Queue,
     disk: File,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     queue_evt: EventFd,
@@ -175,10 +164,9 @@ struct PmemEpollHandler {
 }
 
 impl PmemEpollHandler {
-    fn process_queue(&mut self) -> bool {
-        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        let mut used_count = 0;
-        for mut desc_chain in self.queue.iter().unwrap() {
+    fn process_queue(&mut self) -> result::Result<bool, Error> {
+        let mut used_descs = false;
+        while let Some(mut desc_chain) = self.queue.pop_descriptor_chain(self.mem.memory()) {
             let len = match Request::parse(&mut desc_chain, self.access_platform.as_ref()) {
                 Ok(ref req) if (req.type_ == RequestType::Flush) => {
                     let status_code = match self.disk.sync_all() {
@@ -209,14 +197,13 @@ impl PmemEpollHandler {
                 }
             };
 
-            used_desc_heads[used_count] = (desc_chain.head_index(), len);
-            used_count += 1;
+            self.queue
+                .add_used(desc_chain.memory(), desc_chain.head_index(), len)
+                .map_err(Error::QueueAddUsed)?;
+            used_descs = true;
         }
 
-        for &(desc_index, len) in &used_desc_heads[..used_count] {
-            self.queue.add_used(desc_index, len).unwrap();
-        }
-        used_count > 0
+        Ok(used_descs)
     }
 
     fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
@@ -242,26 +229,39 @@ impl PmemEpollHandler {
 }
 
 impl EpollHelperHandler for PmemEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
             QUEUE_AVAIL_EVENT => {
-                if let Err(e) = self.queue_evt.read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                } else if self.process_queue() {
-                    if let Err(e) = self.signal_used_queue() {
-                        error!("Failed to signal used queue: {:?}", e);
-                        return true;
-                    }
+                self.queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
+
+                let needs_notification = self.process_queue().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to process queue : {:?}", e))
+                })?;
+
+                if needs_notification {
+                    self.signal_used_queue().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             _ => {
-                error!("Unexpected event: {}", ev_type);
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unexpected event: {}",
+                    ev_type
+                )));
             }
         }
-        false
+        Ok(())
     }
 }
 
@@ -343,6 +343,11 @@ impl Pmem {
         self.common.acked_features = state.acked_features;
         self.config = state.config;
     }
+
+    #[cfg(fuzzing)]
+    pub fn wait_for_epoll_threads(&mut self) {
+        self.common.wait_for_epoll_threads();
+    }
 }
 
 impl Drop for Pmem {
@@ -377,23 +382,26 @@ impl VirtioDevice for Pmem {
 
     fn activate(
         &mut self,
-        _mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        mut queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        mut queue_evts: Vec<EventFd>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
         if let Some(disk) = self.disk.as_ref() {
             let disk = disk.try_clone().map_err(|e| {
                 error!("failed cloning pmem disk: {}", e);
                 ActivateError::BadActivate
             })?;
+
+            let (_, queue, queue_evt) = queues.remove(0);
+
             let mut handler = PmemEpollHandler {
-                queue: queues.remove(0),
+                mem,
+                queue,
                 disk,
                 interrupt_cb,
-                queue_evt: queue_evts.remove(0),
+                queue_evt,
                 kill_evt,
                 pause_evt,
                 access_platform: self.common.access_platform.clone(),
@@ -409,11 +417,7 @@ impl VirtioDevice for Pmem {
                 Thread::VirtioPmem,
                 &mut epoll_threads,
                 &self.exit_evt,
-                move || {
-                    if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                        error!("Error running worker: {:?}", e);
-                    }
-                },
+                move || handler.run(paused, paused_sync.unwrap()),
             )?;
 
             self.common.epoll_threads = Some(epoll_threads);

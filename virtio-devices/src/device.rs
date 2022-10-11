@@ -107,8 +107,7 @@ pub trait VirtioDevice: Send {
         &mut self,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_evt: Arc<dyn VirtioInterrupt>,
-        queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        queue_evts: Vec<EventFd>,
+        queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult;
 
     /// Optionally deactivates this device and returns ownership of the guest memory map, interrupt
@@ -173,28 +172,6 @@ pub trait VirtioDevice: Send {
         }
     }
 
-    /// Helper to allow common implementation of write_config
-    fn write_config_helper(&self, config: &mut [u8], offset: u64, data: &[u8]) {
-        let config_len = config.len() as u64;
-        let data_len = data.len() as u64;
-        if offset + data_len > config_len {
-            error!(
-                    "Out-of-bound access to configuration: config_len = {} offset = {:x} length = {} for {}",
-                    config_len,
-                    offset,
-                    data_len,
-                    self.device_type()
-                );
-            return;
-        }
-
-        if let Some(end) = offset.checked_add(config.len() as u64) {
-            let mut offset_config =
-                &mut config[offset as usize..std::cmp::min(end, config_len) as usize];
-            offset_config.write_all(data).unwrap();
-        }
-    }
-
     /// Set the access platform trait to let the device perform address
     /// translations if needed.
     fn set_access_platform(&mut self, _access_platform: Arc<dyn AccessPlatform>) {}
@@ -220,7 +197,6 @@ pub struct VirtioCommon {
     pub acked_features: u64,
     pub kill_evt: Option<EventFd>,
     pub interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
-    pub queue_evts: Option<Vec<EventFd>>,
     pub pause_evt: Option<EventFd>,
     pub paused: Arc<AtomicBool>,
     pub paused_sync: Option<Arc<Barrier>>,
@@ -251,19 +227,9 @@ impl VirtioCommon {
 
     pub fn activate(
         &mut self,
-        queues: &[Queue<GuestMemoryAtomic<GuestMemoryMmap>>],
-        queue_evts: &[EventFd],
+        queues: &[(usize, Queue, EventFd)],
         interrupt_cb: &Arc<dyn VirtioInterrupt>,
     ) -> ActivateResult {
-        if queues.len() != queue_evts.len() {
-            error!(
-                "Cannot activate: length mismatch: queue_evts={} queues={}",
-                queue_evts.len(),
-                queues.len()
-            );
-            return Err(ActivateError::BadActivate);
-        }
-
         if queues.len() < self.min_queues.into() {
             error!(
                 "Number of enabled queues lower than min: {} vs {}",
@@ -289,16 +255,6 @@ impl VirtioCommon {
         // but clone it to pass into the thread.
         self.interrupt_cb = Some(interrupt_cb.clone());
 
-        let mut tmp_queue_evts: Vec<EventFd> = Vec::new();
-        for queue_evt in queue_evts.iter() {
-            // Save the queue EventFD as we need to return it on reset
-            // but clone it to pass into the thread.
-            tmp_queue_evts.push(queue_evt.try_clone().map_err(|e| {
-                error!("failed to clone queue EventFd: {}", e);
-                ActivateError::BadActivate
-            })?);
-        }
-        self.queue_evts = Some(tmp_queue_evts);
         Ok(())
     }
 
@@ -323,6 +279,18 @@ impl VirtioCommon {
 
         // Return the interrupt
         Some(self.interrupt_cb.take().unwrap())
+    }
+
+    // Wait for the worker thread to finish and return
+    #[cfg(fuzzing)]
+    pub fn wait_for_epoll_threads(&mut self) {
+        if let Some(mut threads) = self.epoll_threads.take() {
+            for t in threads.drain(..) {
+                if let Err(e) = t.join() {
+                    error!("Error joining thread: {:?}", e);
+                }
+            }
+        }
     }
 
     pub fn dup_eventfds(&self) -> (EventFd, EventFd) {

@@ -12,6 +12,7 @@ use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::GuestMemoryMmap;
 use crate::{VirtioInterrupt, VirtioInterruptType};
+use anyhow::anyhow;
 use seccompiler::SeccompAction;
 use std::fs::File;
 use std::io;
@@ -19,10 +20,11 @@ use std::os::unix::io::AsRawFd;
 use std::result;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier};
+use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use virtio_queue::Queue;
-use vm_memory::{Bytes, GuestMemoryAtomic};
+use virtio_queue::{Queue, QueueT};
+use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::{AccessPlatform, Translatable};
@@ -34,8 +36,21 @@ const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
 // New descriptors are pending on the virtio queue.
 const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 
+#[derive(Error, Debug)]
+enum Error {
+    #[error("Descriptor chain too short")]
+    DescriptorChainTooShort,
+    #[error("Invalid descriptor")]
+    InvalidDescriptor,
+    #[error("Failed read from guest memory: {0}")]
+    GuestMemoryRead(vm_memory::guest_memory::Error),
+    #[error("Failed adding used index: {0}")]
+    QueueAddUsed(virtio_queue::Error),
+}
+
 struct RngEpollHandler {
-    queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    queue: Queue,
     random_file: File,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     queue_evt: EventFd,
@@ -45,40 +60,36 @@ struct RngEpollHandler {
 }
 
 impl RngEpollHandler {
-    fn process_queue(&mut self) -> bool {
-        let queue = &mut self.queues[0];
+    fn process_queue(&mut self) -> result::Result<bool, Error> {
+        let queue = &mut self.queue;
 
-        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        let mut used_count = 0;
-        for mut desc_chain in queue.iter().unwrap() {
-            let desc = desc_chain.next().unwrap();
-            let mut len = 0;
+        let mut used_descs = false;
+        while let Some(mut desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) {
+            let desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
 
-            // Drivers can only read from the random device.
-            if desc.is_write_only() {
-                // Fill the read with data from the random device on the host.
-                if desc_chain
-                    .memory()
-                    .read_from(
-                        desc.addr()
-                            .translate_gva(self.access_platform.as_ref(), desc.len() as usize),
-                        &mut self.random_file,
-                        desc.len() as usize,
-                    )
-                    .is_ok()
-                {
-                    len = desc.len();
-                }
+            // The descriptor must be write-only and non-zero length
+            if !(desc.is_write_only() && desc.len() > 0) {
+                return Err(Error::InvalidDescriptor);
             }
 
-            used_desc_heads[used_count] = (desc_chain.head_index(), len);
-            used_count += 1;
+            // Fill the read with data from the random device on the host.
+            let len = desc_chain
+                .memory()
+                .read_from(
+                    desc.addr()
+                        .translate_gva(self.access_platform.as_ref(), desc.len() as usize),
+                    &mut self.random_file,
+                    desc.len() as usize,
+                )
+                .map_err(Error::GuestMemoryRead)?;
+
+            queue
+                .add_used(desc_chain.memory(), desc_chain.head_index(), len as u32)
+                .map_err(Error::QueueAddUsed)?;
+            used_descs = true;
         }
 
-        for &(desc_index, len) in &used_desc_heads[..used_count] {
-            queue.add_used(desc_index, len).unwrap();
-        }
-        used_count > 0
+        Ok(used_descs)
     }
 
     fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
@@ -104,26 +115,37 @@ impl RngEpollHandler {
 }
 
 impl EpollHelperHandler for RngEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
             QUEUE_AVAIL_EVENT => {
-                if let Err(e) = self.queue_evt.read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                } else if self.process_queue() {
-                    if let Err(e) = self.signal_used_queue() {
-                        error!("Failed to signal used queue: {:?}", e);
-                        return true;
-                    }
+                self.queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
+                let needs_notification = self.process_queue().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to process queue : {:?}", e))
+                })?;
+                if needs_notification {
+                    self.signal_used_queue().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             _ => {
-                error!("Unexpected event: {}", ev_type);
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unexpected event: {}",
+                    ev_type
+                )));
             }
         }
-        false
+        Ok(())
     }
 }
 
@@ -187,6 +209,11 @@ impl Rng {
         self.common.avail_features = state.avail_features;
         self.common.acked_features = state.acked_features;
     }
+
+    #[cfg(fuzzing)]
+    pub fn wait_for_epoll_threads(&mut self) {
+        self.common.wait_for_epoll_threads();
+    }
 }
 
 impl Drop for Rng {
@@ -217,12 +244,11 @@ impl VirtioDevice for Rng {
 
     fn activate(
         &mut self,
-        _mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        mut queue_evts: Vec<EventFd>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
         if let Some(file) = self.random_file.as_ref() {
@@ -230,11 +256,15 @@ impl VirtioDevice for Rng {
                 error!("failed cloning rng source: {}", e);
                 ActivateError::BadActivate
             })?;
+
+            let (_, queue, queue_evt) = queues.remove(0);
+
             let mut handler = RngEpollHandler {
-                queues,
+                mem,
+                queue,
                 random_file,
                 interrupt_cb,
-                queue_evt: queue_evts.remove(0),
+                queue_evt,
                 kill_evt,
                 pause_evt,
                 access_platform: self.common.access_platform.clone(),
@@ -249,11 +279,7 @@ impl VirtioDevice for Rng {
                 Thread::VirtioRng,
                 &mut epoll_threads,
                 &self.exit_evt,
-                move || {
-                    if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                        error!("Error running worker: {:?}", e);
-                    }
-                },
+                move || handler.run(paused, paused_sync.unwrap()),
             )?;
 
             self.common.epoll_threads = Some(epoll_threads);

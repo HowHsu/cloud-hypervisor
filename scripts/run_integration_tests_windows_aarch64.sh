@@ -3,31 +3,31 @@ set -x
 
 source $HOME/.cargo/env
 source $(dirname "$0")/test-util.sh
+source $(dirname "$0")/common-aarch64.sh
 
 process_common_args "$@"
 # For now these values are default for kvm
 features=""
 
-if [ "$hypervisor" = "mshv" ] ;  then
-    features="--no-default-features --features mshv,common"
+# aarch64 not supported for MSHV
+if [[ "$hypervisor" = "mshv" ]]; then
+    echo "AArch64 is not supported in Microsoft Hypervisor"
+    exit 1
 fi
-WIN_IMAGE_FILE="/root/workloads/windows-server-2019.raw"
 
-WORKLOADS_DIR="/root/workloads"
-OVMF_FW_URL=$(curl --silent https://api.github.com/repos/cloud-hypervisor/edk2/releases/latest | grep "browser_download_url" | grep -o 'https://.*[^ "]')
-OVMF_FW="$WORKLOADS_DIR/CLOUDHV.fd"
-if [ ! -f "$OVMF_FW" ]; then
-    pushd $WORKLOADS_DIR
-    time wget --quiet $OVMF_FW_URL || exit 1
-    popd
-fi
+WIN_IMAGE_BASENAME="windows-11-iot-enterprise-aarch64.raw"
+WIN_IMAGE_FILE="$WORKLOADS_DIR/$WIN_IMAGE_BASENAME"
+
+# Checkout and build EDK2
+OVMF_FW="$WORKLOADS_DIR/CLOUDHV_EFI.fd"
+build_edk2
 
 BUILD_TARGET="$(uname -m)-unknown-linux-${CH_LIBC}"
 CFLAGS=""
 TARGET_CC=""
-if [[ "${BUILD_TARGET}" == "x86_64-unknown-linux-musl" ]]; then
-TARGET_CC="musl-gcc"
-CFLAGS="-I /usr/include/x86_64-linux-musl/ -idirafter /usr/include/"
+if [[ "${BUILD_TARGET}" == "aarch64-unknown-linux-musl" ]]; then
+export TARGET_CC="musl-gcc"
+export RUSTFLAGS="-C link-arg=-lgcc -C link_arg=-specs -C link_arg=/usr/lib/aarch64-linux-musl/musl-gcc.specs"
 fi
 
 # Check if the images are present
@@ -44,14 +44,14 @@ dmsetup mknodes
 dmsetup create windows-snapshot-base --table "0 $img_blk_size snapshot-origin /dev/mapper/windows-base"
 dmsetup mknodes
 
+export RUST_BACKTRACE=1
+
 cargo build --all --release $features --target $BUILD_TARGET
 strip target/$BUILD_TARGET/release/cloud-hypervisor
 
-export RUST_BACKTRACE=1
-
 # Only run with 1 thread to avoid tests interfering with one another because
 # Windows has a static IP configured
-time cargo test $features "windows::$test_filter" -- ${test_binary_args[*]}
+time cargo test $features "windows::$test_filter" --target $BUILD_TARGET -- ${test_binary_args[*]}
 RES=$?
 
 dmsetup remove_all -f

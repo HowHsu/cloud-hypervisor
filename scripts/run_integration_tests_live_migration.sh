@@ -15,7 +15,7 @@ process_common_args "$@"
 features=""
 
 if [ "$hypervisor" = "mshv" ] ;  then
-    features="--no-default-features --features mshv,common"
+    features="--no-default-features --features mshv"
 fi
 
 cp scripts/sha1sums-x86_64 $WORKLOADS_DIR
@@ -46,7 +46,7 @@ fi
 popd
 
 # Download Cloud Hypervisor binary from its last stable release
-LAST_RELEASE_VERSION="v23.0"
+LAST_RELEASE_VERSION="v26.0"
 CH_RELEASE_URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$LAST_RELEASE_VERSION/cloud-hypervisor-static"
 CH_RELEASE_NAME="cloud-hypervisor-static"
 pushd $WORKLOADS_DIR
@@ -96,7 +96,15 @@ echo 6144 | sudo tee /proc/sys/vm/nr_hugepages
 sudo chmod a+rwX /dev/hugepages
 
 export RUST_BACKTRACE=1
-time cargo test $features "live_migration::$test_filter" -- --test-threads=1 ${test_binary_args[*]}
+time cargo test $features "live_migration_parallel::$test_filter" -- ${test_binary_args[*]}
 RES=$?
+
+# Run some tests in sequence since the result could be affected by other tests
+# running in parallel.
+if [ $RES -eq 0 ]; then
+    export RUST_BACKTRACE=1
+    time cargo test $features "live_migration_sequential::$test_filter" -- --test-threads=1 ${test_binary_args[*]}
+    RES=$?
+fi
 
 exit $RES

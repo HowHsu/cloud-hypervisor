@@ -18,6 +18,7 @@ use std::io::Error as IoError;
 use std::os::raw::c_uint;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::{io, mem, net};
+use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_bindings::bindings::virtio_net::{
@@ -35,9 +36,9 @@ pub use open_tap::{open_tap, Error as OpenTapError};
 pub use queue_pair::{NetCounters, NetQueuePair, NetQueuePairError, RxVirtio, TxVirtio};
 pub use tap::{Error as TapError, Tap};
 
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum Error {
-    /// Failed to create a socket.
+    #[error("Failed to create a socket: {0}")]
     CreateSocket(IoError),
 }
 
@@ -130,17 +131,19 @@ pub fn build_net_config_space(
     config: &mut VirtioNetConfig,
     mac: MacAddr,
     num_queues: usize,
+    mtu: Option<u16>,
     avail_features: &mut u64,
 ) {
     config.mac.copy_from_slice(mac.get_bytes());
     *avail_features |= 1 << VIRTIO_NET_F_MAC;
 
-    build_net_config_space_with_mq(config, num_queues, avail_features);
+    build_net_config_space_with_mq(config, num_queues, mtu, avail_features);
 }
 
 pub fn build_net_config_space_with_mq(
     config: &mut VirtioNetConfig,
     num_queues: usize,
+    mtu: Option<u16>,
     avail_features: &mut u64,
 ) {
     let num_queue_pairs = (num_queues / 2) as u16;
@@ -149,6 +152,9 @@ pub fn build_net_config_space_with_mq(
     {
         config.max_virtqueue_pairs = num_queue_pairs;
         *avail_features |= 1 << VIRTIO_NET_F_MQ;
+    }
+    if let Some(mtu) = mtu {
+        config.mtu = mtu;
     }
 }
 

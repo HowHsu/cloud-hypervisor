@@ -19,6 +19,8 @@ use arch::x86_64::{SgxEpcRegion, SgxEpcSection};
 use arch::{layout, RegionType};
 #[cfg(target_arch = "x86_64")]
 use devices::ioapic;
+#[cfg(target_arch = "aarch64")]
+use hypervisor::HypervisorVmError;
 #[cfg(target_arch = "x86_64")]
 use libc::{MAP_NORESERVE, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE};
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Barrier, Mutex};
+use tracer::trace_scoped;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_devices::BlocksState;
@@ -85,7 +88,7 @@ struct HotPlugState {
 
 pub struct VirtioMemZone {
     region: Arc<GuestRegionMmap>,
-    resize_handler: virtio_devices::Resize,
+    virtio_device: Option<Arc<Mutex<virtio_devices::Mem>>>,
     hotplugged_size: u64,
     hugepages: bool,
     blocks_state: Arc<Mutex<BlocksState>>,
@@ -95,8 +98,8 @@ impl VirtioMemZone {
     pub fn region(&self) -> &Arc<GuestRegionMmap> {
         &self.region
     }
-    pub fn resize_handler(&self) -> &virtio_devices::Resize {
-        &self.resize_handler
+    pub fn set_virtio_device(&mut self, virtio_device: Arc<Mutex<virtio_devices::Mem>>) {
+        self.virtio_device = Some(virtio_device);
     }
     pub fn hotplugged_size(&self) -> u64 {
         self.hotplugged_size
@@ -127,6 +130,9 @@ impl MemoryZone {
     }
     pub fn virtio_mem_zone(&self) -> &Option<VirtioMemZone> {
         &self.virtio_mem_zone
+    }
+    pub fn virtio_mem_zone_mut(&mut self) -> Option<&mut VirtioMemZone> {
+        self.virtio_mem_zone.as_mut()
     }
 }
 
@@ -185,6 +191,8 @@ pub struct MemoryManager {
     guest_ram_mappings: Vec<GuestRamMapping>,
 
     pub acpi_address: Option<GuestAddress>,
+    #[cfg(target_arch = "aarch64")]
+    uefi_flash: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
 }
 
 #[derive(Debug)]
@@ -314,6 +322,10 @@ pub enum Error {
 
     /// Failed to allocate MMIO address
     AllocateMmioAddress,
+
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to create UEFI flash
+    CreateUefiFlash(HypervisorVmError),
 }
 
 const ENABLE_FLAG: usize = 0;
@@ -571,8 +583,7 @@ impl MemoryManager {
                             let region_size = region.len();
                             memory_zone.virtio_mem_zone = Some(VirtioMemZone {
                                 region,
-                                resize_handler: virtio_devices::Resize::new(hotplugged_size)
-                                    .map_err(Error::EventFdFail)?,
+                                virtio_device: None,
                                 hotplugged_size,
                                 hugepages: zone_config.hugepages,
                                 blocks_state: Arc::new(Mutex::new(BlocksState::new(region_size))),
@@ -825,6 +836,36 @@ impl MemoryManager {
         Ok(())
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn add_uefi_flash(&mut self) -> Result<(), Error> {
+        // On AArch64, the UEFI binary requires a flash device at address 0.
+        // 4 MiB memory is mapped to simulate the flash.
+        let uefi_mem_slot = self.allocate_memory_slot();
+        let uefi_region = GuestRegionMmap::new(
+            MmapRegion::new(arch::layout::UEFI_SIZE as usize).unwrap(),
+            arch::layout::UEFI_START,
+        )
+        .unwrap();
+        let uefi_mem_region = self.vm.make_user_memory_region(
+            uefi_mem_slot,
+            uefi_region.start_addr().raw_value(),
+            uefi_region.len() as u64,
+            uefi_region.as_ptr() as u64,
+            false,
+            false,
+        );
+        self.vm
+            .create_user_memory_region(uefi_mem_region)
+            .map_err(Error::CreateUefiFlash)?;
+
+        let uefi_flash =
+            GuestMemoryAtomic::new(GuestMemoryMmap::from_regions(vec![uefi_region]).unwrap());
+
+        self.uefi_flash = Some(uefi_flash);
+
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         vm: Arc<dyn hypervisor::Vm>,
@@ -836,6 +877,8 @@ impl MemoryManager {
         existing_memory_files: Option<HashMap<u32, File>>,
         #[cfg(target_arch = "x86_64")] sgx_epc_config: Option<Vec<SgxEpcConfig>>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
+        trace_scoped!("MemoryManager::new");
+
         let user_provided_zones = config.size == 0;
 
         let mmio_address_space_size = mmio_address_space_size(phys_bits);
@@ -964,8 +1007,7 @@ impl MemoryManager {
                             let region_size = region.len();
                             memory_zone.virtio_mem_zone = Some(VirtioMemZone {
                                 region,
-                                resize_handler: virtio_devices::Resize::new(hotplugged_size)
-                                    .map_err(Error::EventFdFail)?,
+                                virtio_device: None,
                                 hotplugged_size,
                                 hugepages: zone.hugepages,
                                 blocks_state: Arc::new(Mutex::new(BlocksState::new(region_size))),
@@ -1081,9 +1123,15 @@ impl MemoryManager {
             arch_mem_regions,
             ram_allocator,
             dynamic,
+            #[cfg(target_arch = "aarch64")]
+            uefi_flash: None,
         };
 
         memory_manager.allocate_address_space()?;
+
+        #[cfg(target_arch = "aarch64")]
+        memory_manager.add_uefi_flash()?;
+
         #[cfg(target_arch = "x86_64")]
         if let Some(sgx_epc_config) = sgx_epc_config {
             memory_manager.setup_sgx(sgx_epc_config)?;
@@ -1584,10 +1632,13 @@ impl MemoryManager {
     pub fn virtio_mem_resize(&mut self, id: &str, size: u64) -> Result<(), Error> {
         if let Some(memory_zone) = self.memory_zones.get_mut(id) {
             if let Some(virtio_mem_zone) = &mut memory_zone.virtio_mem_zone {
-                virtio_mem_zone
-                    .resize_handler()
-                    .work(size)
-                    .map_err(Error::VirtioMemResizeFail)?;
+                if let Some(virtio_mem_device) = virtio_mem_zone.virtio_device.as_ref() {
+                    virtio_mem_device
+                        .lock()
+                        .unwrap()
+                        .resize(size)
+                        .map_err(Error::VirtioMemResizeFail)?;
+                }
 
                 // Keep the hotplugged_size up to date.
                 virtio_mem_zone.hotplugged_size = size;
@@ -1777,6 +1828,10 @@ impl MemoryManager {
         &self.memory_zones
     }
 
+    pub fn memory_zones_mut(&mut self) -> &mut MemoryZones {
+        &mut self.memory_zones
+    }
+
     pub fn memory_range_table(
         &self,
         snapshot: bool,
@@ -1855,6 +1910,11 @@ impl MemoryManager {
 
     pub fn num_guest_ram_mappings(&self) -> u32 {
         self.guest_ram_mappings.len() as u32
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub fn uefi_flash(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
+        self.uefi_flash.as_ref().unwrap().clone()
     }
 
     #[cfg(feature = "guest_debug")]

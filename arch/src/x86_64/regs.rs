@@ -10,7 +10,7 @@ use crate::layout::{BOOT_GDT_START, BOOT_IDT_START, PVH_INFO_START};
 use crate::GuestMemoryMmap;
 use hypervisor::arch::x86::gdt::{gdt_entry, segment_from_gdt};
 use hypervisor::arch::x86::regs::CR0_PE;
-use hypervisor::x86_64::{FpuState, SpecialRegisters, StandardRegisters};
+use hypervisor::arch::x86::{FpuState, SpecialRegisters, StandardRegisters};
 use std::sync::Arc;
 use std::{mem, result};
 use vm_memory::{Address, Bytes, GuestMemory, GuestMemoryError};
@@ -66,7 +66,7 @@ pub fn setup_fpu(vcpu: &Arc<dyn hypervisor::Vcpu>) -> Result<()> {
 ///
 /// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
 pub fn setup_msrs(vcpu: &Arc<dyn hypervisor::Vcpu>) -> Result<()> {
-    vcpu.set_msrs(&hypervisor::x86_64::boot_msr_entries())
+    vcpu.set_msrs(&vcpu.boot_msr_entries())
         .map_err(Error::SetModelSpecificRegisters)?;
 
     Ok(())

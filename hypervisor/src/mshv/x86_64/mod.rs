@@ -7,7 +7,10 @@
 // Copyright 2018-2019 CrowdStrike, Inc.
 //
 //
-use crate::arch::x86::{msr_index, SegmentRegisterOps, MTRR_ENABLE, MTRR_MEM_TYPE_WB};
+use crate::arch::x86::{
+    CpuIdEntry, DescriptorTable, FpuState, LapicState, MsrEntry, SegmentRegister, SpecialRegisters,
+    StandardRegisters,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -15,25 +18,24 @@ use std::fmt;
 /// Export generically-named wrappers of mshv_bindings for Unix-based platforms
 ///
 pub use {
-    mshv_bindings::hv_cpuid_entry as CpuIdEntry,
-    mshv_bindings::mshv_user_mem_region as MemoryRegion, mshv_bindings::msr_entry as MsrEntry,
-    mshv_bindings::CpuId, mshv_bindings::DebugRegisters,
-    mshv_bindings::FloatingPointUnit as FpuState, mshv_bindings::LapicState,
+    mshv_bindings::hv_cpuid_entry, mshv_bindings::mshv_user_mem_region as MemoryRegion,
+    mshv_bindings::msr_entry, mshv_bindings::CpuId, mshv_bindings::DebugRegisters,
+    mshv_bindings::FloatingPointUnit, mshv_bindings::LapicState as MshvLapicState,
     mshv_bindings::MiscRegs as MiscRegisters, mshv_bindings::MsrList,
-    mshv_bindings::Msrs as MsrEntries, mshv_bindings::Msrs, mshv_bindings::SegmentRegister,
-    mshv_bindings::SpecialRegisters, mshv_bindings::StandardRegisters,
-    mshv_bindings::SuspendRegisters, mshv_bindings::VcpuEvents, mshv_bindings::XSave as Xsave,
+    mshv_bindings::Msrs as MsrEntries, mshv_bindings::Msrs,
+    mshv_bindings::SegmentRegister as MshvSegmentRegister,
+    mshv_bindings::SpecialRegisters as MshvSpecialRegisters,
+    mshv_bindings::StandardRegisters as MshvStandardRegisters, mshv_bindings::SuspendRegisters,
+    mshv_bindings::TableRegister, mshv_bindings::VcpuEvents, mshv_bindings::XSave as Xsave,
     mshv_bindings::Xcrs as ExtendedControlRegisters,
 };
 
-pub const CPUID_FLAG_VALID_INDEX: u32 = 0;
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VcpuMshvState {
-    pub msrs: MsrEntries,
+    pub msrs: Vec<MsrEntry>,
     pub vcpu_events: VcpuEvents,
-    pub regs: StandardRegisters,
-    pub sregs: SpecialRegisters,
+    pub regs: MshvStandardRegisters,
+    pub sregs: MshvSpecialRegisters,
     pub fpu: FpuState,
     pub xcrs: ExtendedControlRegisters,
     pub lapic: LapicState,
@@ -44,10 +46,10 @@ pub struct VcpuMshvState {
 
 impl fmt::Display for VcpuMshvState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let expected_num_msrs = self.msrs.as_fam_struct_ref().nmsrs as usize;
+        let expected_num_msrs = self.msrs.len();
         let mut msr_entries = vec![vec![0; 2]; expected_num_msrs];
 
-        for (i, entry) in self.msrs.as_slice().iter().enumerate() {
+        for (i, entry) in self.msrs.iter().enumerate() {
             msr_entries[i][1] = entry.data;
             msr_entries[i][0] = entry.index as u64;
         }
@@ -66,87 +68,252 @@ impl fmt::Display for VcpuMshvState {
     }
 }
 
-pub struct IrqRouting {}
-pub enum VcpuExit {}
-pub struct MpState {}
-
-impl SegmentRegisterOps for SegmentRegister {
-    fn segment_type(&self) -> u8 {
-        self.type_
-    }
-    fn set_segment_type(&mut self, val: u8) {
-        self.type_ = val;
-    }
-
-    fn dpl(&self) -> u8 {
-        self.dpl
-    }
-
-    fn set_dpl(&mut self, val: u8) {
-        self.dpl = val;
-    }
-
-    fn present(&self) -> u8 {
-        self.present
-    }
-
-    fn set_present(&mut self, val: u8) {
-        self.present = val;
-    }
-
-    fn long(&self) -> u8 {
-        self.l
-    }
-
-    fn set_long(&mut self, val: u8) {
-        self.l = val;
-    }
-
-    fn avl(&self) -> u8 {
-        self.avl
-    }
-
-    fn set_avl(&mut self, val: u8) {
-        self.avl = val;
-    }
-
-    fn desc_type(&self) -> u8 {
-        self.s
-    }
-
-    fn set_desc_type(&mut self, val: u8) {
-        self.s = val;
-    }
-
-    fn granularity(&self) -> u8 {
-        self.g
-    }
-
-    fn set_granularity(&mut self, val: u8) {
-        self.g = val;
-    }
-
-    fn db(&self) -> u8 {
-        self.db
-    }
-
-    fn set_db(&mut self, val: u8) {
-        self.db = val;
+impl From<StandardRegisters> for MshvStandardRegisters {
+    fn from(regs: StandardRegisters) -> Self {
+        Self {
+            rax: regs.rax,
+            rbx: regs.rbx,
+            rcx: regs.rcx,
+            rdx: regs.rdx,
+            rsi: regs.rsi,
+            rdi: regs.rdi,
+            rsp: regs.rsp,
+            rbp: regs.rbp,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+            r11: regs.r11,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rip: regs.rip,
+            rflags: regs.rflags,
+        }
     }
 }
 
-pub fn boot_msr_entries() -> MsrEntries {
-    MsrEntries::from_entries(&[
-        msr!(msr_index::MSR_IA32_SYSENTER_CS),
-        msr!(msr_index::MSR_IA32_SYSENTER_ESP),
-        msr!(msr_index::MSR_IA32_SYSENTER_EIP),
-        msr!(msr_index::MSR_STAR),
-        msr!(msr_index::MSR_CSTAR),
-        msr!(msr_index::MSR_LSTAR),
-        msr!(msr_index::MSR_KERNEL_GS_BASE),
-        msr!(msr_index::MSR_SYSCALL_MASK),
-        msr!(msr_index::MSR_IA32_TSC),
-        msr_data!(msr_index::MSR_MTRRdefType, MTRR_ENABLE | MTRR_MEM_TYPE_WB),
-    ])
-    .unwrap()
+impl From<MshvStandardRegisters> for StandardRegisters {
+    fn from(regs: MshvStandardRegisters) -> Self {
+        Self {
+            rax: regs.rax,
+            rbx: regs.rbx,
+            rcx: regs.rcx,
+            rdx: regs.rdx,
+            rsi: regs.rsi,
+            rdi: regs.rdi,
+            rsp: regs.rsp,
+            rbp: regs.rbp,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+            r11: regs.r11,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rip: regs.rip,
+            rflags: regs.rflags,
+        }
+    }
+}
+
+impl From<SegmentRegister> for MshvSegmentRegister {
+    fn from(s: SegmentRegister) -> Self {
+        Self {
+            base: s.base,
+            limit: s.limit,
+            selector: s.selector,
+            type_: s.type_,
+            present: s.present,
+            dpl: s.dpl,
+            db: s.db,
+            s: s.s,
+            l: s.l,
+            g: s.g,
+            avl: s.avl,
+            unusable: s.unusable,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<MshvSegmentRegister> for SegmentRegister {
+    fn from(s: MshvSegmentRegister) -> Self {
+        Self {
+            base: s.base,
+            limit: s.limit,
+            selector: s.selector,
+            type_: s.type_,
+            present: s.present,
+            dpl: s.dpl,
+            db: s.db,
+            s: s.s,
+            l: s.l,
+            g: s.g,
+            avl: s.avl,
+            unusable: s.unusable,
+        }
+    }
+}
+
+impl From<DescriptorTable> for TableRegister {
+    fn from(dt: DescriptorTable) -> Self {
+        Self {
+            base: dt.base,
+            limit: dt.limit,
+        }
+    }
+}
+
+impl From<TableRegister> for DescriptorTable {
+    fn from(dt: TableRegister) -> Self {
+        Self {
+            base: dt.base,
+            limit: dt.limit,
+        }
+    }
+}
+
+impl From<SpecialRegisters> for MshvSpecialRegisters {
+    fn from(s: SpecialRegisters) -> Self {
+        Self {
+            cs: s.cs.into(),
+            ds: s.ds.into(),
+            es: s.es.into(),
+            fs: s.fs.into(),
+            gs: s.gs.into(),
+            ss: s.ss.into(),
+            tr: s.tr.into(),
+            ldt: s.ldt.into(),
+            gdt: s.gdt.into(),
+            idt: s.idt.into(),
+            cr0: s.cr0,
+            cr2: s.cr2,
+            cr3: s.cr3,
+            cr4: s.cr4,
+            cr8: s.cr8,
+            efer: s.efer,
+            apic_base: s.apic_base,
+            interrupt_bitmap: s.interrupt_bitmap,
+        }
+    }
+}
+
+impl From<MshvSpecialRegisters> for SpecialRegisters {
+    fn from(s: MshvSpecialRegisters) -> Self {
+        Self {
+            cs: s.cs.into(),
+            ds: s.ds.into(),
+            es: s.es.into(),
+            fs: s.fs.into(),
+            gs: s.gs.into(),
+            ss: s.ss.into(),
+            tr: s.tr.into(),
+            ldt: s.ldt.into(),
+            gdt: s.gdt.into(),
+            idt: s.idt.into(),
+            cr0: s.cr0,
+            cr2: s.cr2,
+            cr3: s.cr3,
+            cr4: s.cr4,
+            cr8: s.cr8,
+            efer: s.efer,
+            apic_base: s.apic_base,
+            interrupt_bitmap: s.interrupt_bitmap,
+        }
+    }
+}
+
+impl From<CpuIdEntry> for hv_cpuid_entry {
+    fn from(e: CpuIdEntry) -> Self {
+        Self {
+            function: e.function,
+            index: e.index,
+            flags: e.flags,
+            eax: e.eax,
+            ebx: e.ebx,
+            ecx: e.ecx,
+            edx: e.edx,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<hv_cpuid_entry> for CpuIdEntry {
+    fn from(e: hv_cpuid_entry) -> Self {
+        Self {
+            function: e.function,
+            index: e.index,
+            flags: e.flags,
+            eax: e.eax,
+            ebx: e.ebx,
+            ecx: e.ecx,
+            edx: e.edx,
+        }
+    }
+}
+
+impl From<FloatingPointUnit> for FpuState {
+    fn from(s: FloatingPointUnit) -> Self {
+        Self {
+            fpr: s.fpr,
+            fcw: s.fcw,
+            fsw: s.fsw,
+            ftwx: s.ftwx,
+            last_opcode: s.last_opcode,
+            last_ip: s.last_ip,
+            last_dp: s.last_dp,
+            xmm: s.xmm,
+            mxcsr: s.mxcsr,
+        }
+    }
+}
+
+impl From<FpuState> for FloatingPointUnit {
+    fn from(s: FpuState) -> Self {
+        Self {
+            fpr: s.fpr,
+            fcw: s.fcw,
+            fsw: s.fsw,
+            ftwx: s.ftwx,
+            last_opcode: s.last_opcode,
+            last_ip: s.last_ip,
+            last_dp: s.last_dp,
+            xmm: s.xmm,
+            mxcsr: s.mxcsr,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<LapicState> for MshvLapicState {
+    fn from(s: LapicState) -> Self {
+        Self { regs: s.regs }
+    }
+}
+
+impl From<MshvLapicState> for LapicState {
+    fn from(s: MshvLapicState) -> Self {
+        Self { regs: s.regs }
+    }
+}
+
+impl From<msr_entry> for MsrEntry {
+    fn from(e: msr_entry) -> Self {
+        Self {
+            index: e.index,
+            data: e.data,
+        }
+    }
+}
+
+impl From<MsrEntry> for msr_entry {
+    fn from(e: MsrEntry) -> Self {
+        Self {
+            index: e.index,
+            data: e.data,
+            ..Default::default()
+        }
+    }
 }

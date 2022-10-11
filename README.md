@@ -4,10 +4,12 @@
     - [Architectures](#architectures)
     - [Guest OS](#guest-os)
 - [2. Getting Started](#2-getting-started)
+  - [Host OS](#host-os)
   - [Preparation](#preparation)
   - [Install prerequisites](#install-prerequisites)
   - [Clone and build](#clone-and-build)
     - [Containerized builds and tests](#containerized-builds-and-tests)
+  - [Use Prebuilt Binaries](#use-prebuilt-binaries)
   - [Run](#run)
     - [Cloud image](#cloud-image)
     - [Custom kernel and disk image](#custom-kernel-and-disk-image)
@@ -18,11 +20,13 @@
   - [Hot Plug](#hot-plug)
   - [Device Model](#device-model)
   - [TODO](#todo)
+  - [Roadmap](#roadmap)
 - [4. `rust-vmm` project dependency](#4-rust-vmm-project-dependency)
   - [Firecracker and crosvm](#firecracker-and-crosvm)
 - [5. Community](#5-community)
   - [Contribute](#contribute)
-  - [Join us](#join-us)
+  - [Slack](#slack)
+  - [Mailing list](#mailing-list)
   - [Security issues](#security-issues)
 
 # 1. What is Cloud Hypervisor?
@@ -72,6 +76,12 @@ Below sections describe how to build and run Cloud Hypervisor on the `x86_64`
 platform. For getting started on the `AArch64` platform, please refer to the
 [Arm64 documentation](docs/arm64.md).
 
+## Host OS
+
+Based on required KVM functionality the minimum host kernel version is 4.11.
+For adequate peformance the minimum recommended host kernel vesion is 5.6. The
+majority of the CI currently tests with kernel version 5.15.
+
 ## Preparation
 
 We create a folder to build and run `cloud-hypervisor` at `$HOME/cloud-hypervisor`
@@ -88,8 +98,8 @@ Hypervisor. Here, all the steps are based on Ubuntu, for other Linux
 distributions please replace the package manager and package name.
 
 ```shell
-# Install build-essential, git, and qemu-img
-$ sudo apt install git build-essential qemu-img
+# Install build-essential, git, and qemu-utils
+$ sudo apt install git build-essential qemu-utils
 # Install rust tool chain
 $ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 # If you want to build statically linked binary please add musl target
@@ -145,6 +155,15 @@ $ ./scripts/dev_cli.sh tests --unit
 Run the `./scripts/dev_cli.sh --help` command to view all the supported
 development script commands and their related options.
 
+## Use Prebuilt Binaries
+
+Cloud Hypervisor packages targeting some popular Linux distributions are available
+thanks to the [Open Build Service](https://build.opensuse.org). The
+[OBS README](https://github.com/cloud-hypervisor/obs-packaging) explains how to
+enable the repository in a supported Linux distribution and install Cloud Hypervisor
+and accompanying packages. Please report any packaging issues in the
+[obs-packaging](https://github.com/cloud-hypervisor/obs-packaging) repository.
+
 ## Run
 
 You can run a guest VM by either using an existing cloud image or booting into
@@ -166,7 +185,7 @@ cloud image. Here we will use a Ubuntu image:
 $ pushd $CLOUDH
 $ wget https://cloud-images.ubuntu.com/focal/current/focal-server-cloudimg-amd64.img
 $ qemu-img convert -p -f qcow2 -O raw focal-server-cloudimg-amd64.img focal-server-cloudimg-amd64.raw
-$ wget https://github.com/cloud-hypervisor/rust-hypervisor-firmware/releases/download/0.4.0/hypervisor-fw
+$ wget https://github.com/cloud-hypervisor/rust-hypervisor-firmware/releases/download/0.4.1/hypervisor-fw
 $ popd
 ```
 
@@ -309,6 +328,10 @@ file but through
 [github issues](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/new)
 instead.
 
+## Roadmap
+
+The project roadmap is tracked through a [GitHub project](https://github.com/orgs/cloud-hypervisor/projects/6).
+
 # 4. `rust-vmm` project dependency
 
 In order to satisfy the design goal of having a high-performance,
@@ -370,10 +393,17 @@ reviews, bug reports, feature requests, project improvement suggestions, etc,
 are all equal and welcome means of contribution. See the
 [CONTRIBUTING](CONTRIBUTING.md) document for more details.
 
-## Join us
+## Slack
 
 Get an [invite to our Slack channel](https://join.slack.com/t/cloud-hypervisor/shared_invite/enQtNjY3MTE3MDkwNDQ4LWQ1MTA1ZDVmODkwMWQ1MTRhYzk4ZGNlN2UwNTI3ZmFlODU0OTcwOWZjMTkwZDExYWE3YjFmNzgzY2FmNDAyMjI)
 and [join us on Slack](https://cloud-hypervisor.slack.com/).
+
+## Mailing list
+
+Please report bugs using the [GitHub issue
+tracker](https://github.com/cloud-hypervisor/cloud-hypervisor/issues) but for
+broader community discussions you may use our [mailing
+list](https://lists.cloudhypervisor.org/g/dev/).
 
 ## Security issues
 

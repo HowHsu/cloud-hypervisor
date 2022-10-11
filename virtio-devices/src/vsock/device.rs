@@ -37,6 +37,7 @@ use crate::{
     EpollHelperHandler, VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterruptType,
     EPOLL_HELPER_EVENT_LAST, VIRTIO_F_IN_ORDER, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1,
 };
+use anyhow::anyhow;
 use byteorder::{ByteOrder, LittleEndian};
 use seccompiler::SeccompAction;
 use std::io;
@@ -48,6 +49,9 @@ use std::sync::{Arc, Barrier, RwLock};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use virtio_queue::Queue;
+use virtio_queue::QueueOwnedT;
+use virtio_queue::QueueT;
+use vm_memory::GuestAddressSpace;
 use vm_memory::GuestMemoryAtomic;
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, VersionMapped,
@@ -88,7 +92,7 @@ pub const BACKEND_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 4;
 ///
 pub struct VsockEpollHandler<B: VsockBackend> {
     pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
-    pub queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
+    pub queues: Vec<Queue>,
     pub queue_evts: Vec<EventFd>,
     pub kill_evt: EventFd,
     pub pause_evt: EventFd,
@@ -121,11 +125,9 @@ where
     fn process_rx(&mut self) -> result::Result<(), DeviceError> {
         debug!("vsock: epoll_handler::process_rx()");
 
-        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        let mut used_count = 0;
+        let mut used_descs = false;
 
-        let mut avail_iter = self.queues[0].iter().map_err(DeviceError::QueueIterator)?;
-        for mut desc_chain in &mut avail_iter {
+        while let Some(mut desc_chain) = self.queues[0].pop_descriptor_chain(self.mem.memory()) {
             let used_len = match VsockPacket::from_rx_virtq_head(
                 &mut desc_chain,
                 self.access_platform.as_ref(),
@@ -136,7 +138,7 @@ where
                     } else {
                         // We are using a consuming iterator over the virtio buffers, so, if we can't
                         // fill in this buffer, we'll need to undo the last iterator step.
-                        avail_iter.go_to_previous_position();
+                        self.queues[0].go_to_previous_position();
                         break;
                     }
                 }
@@ -146,17 +148,13 @@ where
                 }
             };
 
-            used_desc_heads[used_count] = (desc_chain.head_index(), used_len);
-            used_count += 1;
-        }
-
-        for &(desc_index, len) in &used_desc_heads[..used_count] {
             self.queues[0]
-                .add_used(desc_index, len)
+                .add_used(desc_chain.memory(), desc_chain.head_index(), used_len)
                 .map_err(DeviceError::QueueAddUsed)?;
+            used_descs = true;
         }
 
-        if used_count > 0 {
+        if used_descs {
             self.signal_used_queue(0)
         } else {
             Ok(())
@@ -169,11 +167,9 @@ where
     fn process_tx(&mut self) -> result::Result<(), DeviceError> {
         debug!("vsock: epoll_handler::process_tx()");
 
-        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        let mut used_count = 0;
+        let mut used_descs = false;
 
-        let mut avail_iter = self.queues[1].iter().map_err(DeviceError::QueueIterator)?;
-        for mut desc_chain in &mut avail_iter {
+        while let Some(mut desc_chain) = self.queues[1].pop_descriptor_chain(self.mem.memory()) {
             let pkt = match VsockPacket::from_tx_virtq_head(
                 &mut desc_chain,
                 self.access_platform.as_ref(),
@@ -181,28 +177,26 @@ where
                 Ok(pkt) => pkt,
                 Err(e) => {
                     error!("vsock: error reading TX packet: {:?}", e);
-                    used_desc_heads[used_count] = (desc_chain.head_index(), 0);
-                    used_count += 1;
+                    self.queues[1]
+                        .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                        .map_err(DeviceError::QueueAddUsed)?;
+                    used_descs = true;
                     continue;
                 }
             };
 
             if self.backend.write().unwrap().send_pkt(&pkt).is_err() {
-                avail_iter.go_to_previous_position();
+                self.queues[1].go_to_previous_position();
                 break;
             }
 
-            used_desc_heads[used_count] = (desc_chain.head_index(), 0);
-            used_count += 1;
-        }
-
-        for &(desc_index, len) in &used_desc_heads[..used_count] {
             self.queues[1]
-                .add_used(desc_index, len)
+                .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
                 .map_err(DeviceError::QueueAddUsed)?;
+            used_descs = true;
         }
 
-        if used_count > 0 {
+        if used_descs {
             self.signal_used_queue(1)
         } else {
             Ok(())
@@ -229,13 +223,17 @@ impl<B> EpollHelperHandler for VsockEpollHandler<B>
 where
     B: VsockBackend,
 {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let evset = match epoll::Events::from_bits(event.events) {
             Some(evset) => evset,
             None => {
                 let evbits = event.events;
                 warn!("epoll: ignoring unknown event set: 0x{:x}", evbits);
-                return false;
+                return Ok(());
             }
         };
 
@@ -243,43 +241,45 @@ where
         match ev_type {
             RX_QUEUE_EVENT => {
                 debug!("vsock: RX queue event");
-                if let Err(e) = self.queue_evts[0].read() {
-                    error!("Failed to get RX queue event: {:?}", e);
-                    return true;
-                } else if self.backend.read().unwrap().has_pending_rx() {
-                    if let Err(e) = self.process_rx() {
-                        error!("Failed to process RX queue: {:?}", e);
-                        return true;
-                    }
+                self.queue_evts[0].read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get RX queue event: {:?}", e))
+                })?;
+                if self.backend.read().unwrap().has_pending_rx() {
+                    self.process_rx().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process RX queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             TX_QUEUE_EVENT => {
                 debug!("vsock: TX queue event");
-                if let Err(e) = self.queue_evts[1].read() {
-                    error!("Failed to get TX queue event: {:?}", e);
-                    return true;
-                } else {
-                    if let Err(e) = self.process_tx() {
-                        error!("Failed to process TX queue: {:?}", e);
-                        return true;
-                    }
-                    // The backend may have queued up responses to the packets we sent during TX queue
-                    // processing. If that happened, we need to fetch those responses and place them
-                    // into RX buffers.
-                    if self.backend.read().unwrap().has_pending_rx() {
-                        if let Err(e) = self.process_rx() {
-                            error!("Failed to process RX queue: {:?}", e);
-                            return true;
-                        }
-                    }
+                self.queue_evts[1].read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get TX queue event: {:?}", e))
+                })?;
+
+                self.process_tx().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to process TX queue: {:?}", e))
+                })?;
+
+                // The backend may have queued up responses to the packets we sent during TX queue
+                // processing. If that happened, we need to fetch those responses and place them
+                // into RX buffers.
+                if self.backend.read().unwrap().has_pending_rx() {
+                    self.process_rx().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process RX queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             EVT_QUEUE_EVENT => {
                 debug!("vsock: EVT queue event");
-                if let Err(e) = self.queue_evts[2].read() {
-                    error!("Failed to get EVT queue event: {:?}", e);
-                    return true;
-                }
+                self.queue_evts[2].read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get EVT queue event: {:?}", e))
+                })?;
             }
             BACKEND_EVENT => {
                 debug!("vsock: backend event");
@@ -289,24 +289,26 @@ where
                 // In particular, if `self.backend.send_pkt()` halted the TX queue processing (by
                 // returning an error) at some point in the past, now is the time to try walking the
                 // TX queue again.
-                if let Err(e) = self.process_tx() {
-                    error!("Failed to process TX queue: {:?}", e);
-                    return true;
-                }
+                self.process_tx().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to process TX queue: {:?}", e))
+                })?;
                 if self.backend.read().unwrap().has_pending_rx() {
-                    if let Err(e) = self.process_rx() {
-                        error!("Failed to process RX queue: {:?}", e);
-                        return true;
-                    }
+                    self.process_rx().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process RX queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             _ => {
-                error!("Unknown event for virtio-vsock");
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unknown event for virtio-vsock"
+                )));
             }
         }
 
-        false
+        Ok(())
     }
 }
 
@@ -432,15 +434,21 @@ where
         &mut self,
         mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        queue_evts: Vec<EventFd>,
+        queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
+
+        let mut virtqueues = Vec::new();
+        let mut queue_evts = Vec::new();
+        for (_, queue, queue_evt) in queues {
+            virtqueues.push(queue);
+            queue_evts.push(queue_evt);
+        }
 
         let mut handler = VsockEpollHandler {
             mem,
-            queues,
+            queues: virtqueues,
             queue_evts,
             kill_evt,
             pause_evt,
@@ -459,11 +467,7 @@ where
             Thread::VirtioVsock,
             &mut epoll_threads,
             &self.exit_evt,
-            move || {
-                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                    error!("Error running worker: {:?}", e);
-                }
-            },
+            move || handler.run(paused, paused_sync.unwrap()),
         )?;
 
         self.common.epoll_threads = Some(epoll_threads);
@@ -586,34 +590,38 @@ mod tests {
         // A warning is, however, logged, if the guest driver attempts to write any config data.
         ctx.device.write_config(0, &data[..4]);
 
+        let memory = GuestMemoryAtomic::new(ctx.mem.clone());
+
         // Test a bad activation.
-        let bad_activate = ctx.device.activate(
-            GuestMemoryAtomic::new(ctx.mem.clone()),
-            Arc::new(NoopVirtioInterrupt {}),
-            Vec::new(),
-            Vec::new(),
-        );
+        let bad_activate =
+            ctx.device
+                .activate(memory.clone(), Arc::new(NoopVirtioInterrupt {}), Vec::new());
         match bad_activate {
             Err(ActivateError::BadActivate) => (),
             other => panic!("{:?}", other),
         }
 
-        let memory = GuestMemoryAtomic::new(ctx.mem.clone());
-
         // Test a correct activation.
         ctx.device
             .activate(
-                memory.clone(),
+                memory,
                 Arc::new(NoopVirtioInterrupt {}),
                 vec![
-                    Queue::new(memory.clone(), 256),
-                    Queue::new(memory.clone(), 256),
-                    Queue::new(memory, 256),
-                ],
-                vec![
-                    EventFd::new(EFD_NONBLOCK).unwrap(),
-                    EventFd::new(EFD_NONBLOCK).unwrap(),
-                    EventFd::new(EFD_NONBLOCK).unwrap(),
+                    (
+                        0,
+                        Queue::new(256).unwrap(),
+                        EventFd::new(EFD_NONBLOCK).unwrap(),
+                    ),
+                    (
+                        1,
+                        Queue::new(256).unwrap(),
+                        EventFd::new(EFD_NONBLOCK).unwrap(),
+                    ),
+                    (
+                        2,
+                        Queue::new(256).unwrap(),
+                        EventFd::new(EFD_NONBLOCK).unwrap(),
+                    ),
                 ],
             )
             .unwrap();
@@ -625,9 +633,8 @@ mod tests {
         {
             let test_ctx = TestContext::new();
             let ctx = test_ctx.create_epoll_handler_context();
-            let memory = GuestMemoryAtomic::new(test_ctx.mem.clone());
 
-            let _queue: Queue<GuestMemoryAtomic<GuestMemoryMmap>> = Queue::new(memory, 256);
+            let _queue: Queue = Queue::new(256).unwrap();
             assert!(ctx.handler.signal_used_queue(0).is_ok());
         }
     }
@@ -712,7 +719,7 @@ mod tests {
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
 
             assert!(
-                ctx.handler.handle_event(&mut epoll_helper, &event),
+                ctx.handler.handle_event(&mut epoll_helper, &event).is_err(),
                 "handle_event() should have failed"
             );
         }
@@ -781,7 +788,7 @@ mod tests {
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
 
             assert!(
-                ctx.handler.handle_event(&mut epoll_helper, &event),
+                ctx.handler.handle_event(&mut epoll_helper, &event).is_err(),
                 "handle_event() should have failed"
             );
         }
@@ -801,7 +808,7 @@ mod tests {
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
 
             assert!(
-                ctx.handler.handle_event(&mut epoll_helper, &event),
+                ctx.handler.handle_event(&mut epoll_helper, &event).is_err(),
                 "handle_event() should have failed"
             );
         }
@@ -822,7 +829,7 @@ mod tests {
             let event = epoll::Event::new(events, BACKEND_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
-            ctx.handler.handle_event(&mut epoll_helper, &event);
+            assert!(ctx.handler.handle_event(&mut epoll_helper, &event).is_ok());
 
             // The backend should've received this event.
             assert_eq!(
@@ -848,7 +855,7 @@ mod tests {
             let event = epoll::Event::new(events, BACKEND_EVENT as u64);
             let mut epoll_helper =
                 EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
-            ctx.handler.handle_event(&mut epoll_helper, &event);
+            assert!(ctx.handler.handle_event(&mut epoll_helper, &event).is_ok());
 
             // The backend should've received this event.
             assert_eq!(
@@ -873,7 +880,7 @@ mod tests {
             EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
 
         assert!(
-            ctx.handler.handle_event(&mut epoll_helper, &event),
+            ctx.handler.handle_event(&mut epoll_helper, &event).is_err(),
             "handle_event() should have failed"
         );
     }

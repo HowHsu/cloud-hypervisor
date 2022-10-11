@@ -4,29 +4,44 @@
 //
 
 use once_cell::sync::Lazy;
+use serde_json::Value;
 use ssh2::Session;
 use std::env;
 use std::ffi::OsStr;
-use std::fmt::Debug;
-use std::fs;
 use std::io;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
+use std::{fmt, fs};
 use vmm_sys_util::tempdir::TempDir;
+use wait_timeout::ChildExt;
+
+#[derive(Debug)]
+pub enum WaitTimeoutError {
+    Timedout,
+    ExitStatus,
+    General(std::io::Error),
+}
 
 #[derive(Debug)]
 pub enum Error {
     Parsing(std::num::ParseIntError),
     SshCommand(SshCommandError),
     WaitForBoot(WaitForBootError),
+    EthrLogFile(std::io::Error),
+    EthrLogParse,
+    FioOutputParse,
+    Iperf3Parse,
+    Spawn(std::io::Error),
+    WaitTimeout(WaitTimeoutError),
 }
 
 impl From<SshCommandError> for Error {
@@ -75,13 +90,15 @@ impl GuestNetworkConfig {
 
         match (|| -> Result<(), WaitForBootError> {
             let listener =
-                TcpListener::bind(&listen_addr.as_str()).map_err(WaitForBootError::Listen)?;
+                TcpListener::bind(listen_addr.as_str()).map_err(WaitForBootError::Listen)?;
             listener
                 .set_nonblocking(true)
                 .expect("Cannot set non-blocking for tcp listener");
 
             // Reply on epoll w/ timeout to wait for guest connections faithfully
             let epoll_fd = epoll::create(true).expect("Cannot create epoll fd");
+            // Use 'File' to enforce closing on 'epoll_fd'
+            let _epoll_file = unsafe { fs::File::from_raw_fd(epoll_fd) };
             epoll::ctl(
                 epoll_fd,
                 epoll::ControlOptions::EPOLL_CTL_ADD,
@@ -211,7 +228,7 @@ impl Drop for WindowsDiskConfig {
 
         // losetup -d <loopback_device>
         std::process::Command::new("losetup")
-            .args(&["-d", self.loopback_device.as_str()])
+            .args(["-d", self.loopback_device.as_str()])
             .output()
             .expect("Expect removing loopback device to succeed");
     }
@@ -283,8 +300,8 @@ impl DiskConfig for UbuntuDiskConfig {
             .expect("Expected writing out network-config to succeed");
 
         std::process::Command::new("mkdosfs")
-            .args(&["-n", "cidata"])
-            .args(&["-C", cloudinit_file_path.as_str()])
+            .args(["-n", "cidata"])
+            .args(["-C", cloudinit_file_path.as_str()])
             .arg("8192")
             .output()
             .expect("Expect creating disk image to succeed");
@@ -294,8 +311,8 @@ impl DiskConfig for UbuntuDiskConfig {
             .for_each(|x| {
                 std::process::Command::new("mcopy")
                     .arg("-o")
-                    .args(&["-i", cloudinit_file_path.as_str()])
-                    .args(&["-s", cloud_init_directory.join(x).to_str().unwrap(), "::"])
+                    .args(["-i", cloudinit_file_path.as_str()])
+                    .args(["-s", cloud_init_directory.join(x).to_str().unwrap(), "::"])
                     .output()
                     .expect("Expect copying files to disk image to succeed");
             });
@@ -379,7 +396,7 @@ impl DiskConfig for WindowsDiskConfig {
         std::process::Command::new("dmsetup")
             .arg("create")
             .arg(windows_snapshot_cow.as_str())
-            .args(&[
+            .args([
                 "--table",
                 format!("0 {} linear {} 0", cow_file_blk_size, self.loopback_device).as_str(),
             ])
@@ -398,7 +415,7 @@ impl DiskConfig for WindowsDiskConfig {
         std::process::Command::new("dmsetup")
             .arg("create")
             .arg(windows_snapshot.as_str())
-            .args(&[
+            .args([
                 "--table",
                 format!(
                     "0 {} snapshot /dev/mapper/windows-base /dev/mapper/{} P 8",
@@ -706,14 +723,14 @@ pub fn ssh_command_ip(
 
 pub fn exec_host_command_status(command: &str) -> ExitStatus {
     std::process::Command::new("bash")
-        .args(&["-c", command])
+        .args(["-c", command])
         .status()
         .unwrap_or_else(|_| panic!("Expected '{}' to run", command))
 }
 
 pub fn exec_host_command_output(command: &str) -> Output {
     std::process::Command::new("bash")
-        .args(&["-c", command])
+        .args(["-c", command])
         .output()
         .unwrap_or_else(|_| panic!("Expected '{}' to run", command))
 }
@@ -779,6 +796,13 @@ impl Guest {
         )
     }
 
+    pub fn default_net_string_w_mtu(&self, mtu: u16) -> String {
+        format!(
+            "tap=,mac={},ip={},mask=255.255.255.0,mtu={}",
+            self.network.guest_mac, self.network.host_ip, mtu
+        )
+    }
+
     pub fn ssh_command(&self, command: &str) -> Result<String, SshCommandError> {
         ssh_command_ip(
             command,
@@ -829,7 +853,7 @@ impl Guest {
     }
 
     pub fn api_create_body(&self, cpu_count: u8, kernel_path: &str, kernel_cmd: &str) -> String {
-        format! {"{{\"cpus\":{{\"boot_vcpus\":{},\"max_vcpus\":{}}},\"kernel\":{{\"path\":\"{}\"}},\"cmdline\":{{\"args\": \"{}\"}},\"net\":[{{\"ip\":\"{}\", \"mask\":\"255.255.255.0\", \"mac\":\"{}\"}}], \"disks\":[{{\"path\":\"{}\"}}, {{\"path\":\"{}\"}}]}}",
+        format! {"{{\"cpus\":{{\"boot_vcpus\":{},\"max_vcpus\":{}}},\"payload\":{{\"kernel\":\"{}\",\"cmdline\": \"{}\"}},\"net\":[{{\"ip\":\"{}\", \"mask\":\"255.255.255.0\", \"mac\":\"{}\"}}], \"disks\":[{{\"path\":\"{}\"}}, {{\"path\":\"{}\"}}]}}",
                  cpu_count,
                  cpu_count,
                  kernel_path,
@@ -1240,15 +1264,24 @@ impl<'a> GuestCommand<'a> {
 
             let fd = child.stdout.as_ref().unwrap().as_raw_fd();
             let pipesize = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_SIZE) };
+            if pipesize == -1 {
+                return Err(io::Error::last_os_error());
+            }
             let fd = child.stderr.as_ref().unwrap().as_raw_fd();
             let pipesize1 = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_SIZE) };
+            if pipesize1 == -1 {
+                return Err(io::Error::last_os_error());
+            }
 
             if pipesize >= PIPE_SIZE && pipesize1 >= PIPE_SIZE {
                 Ok(child)
             } else {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    "resizing pipe w/ 'fnctl' failed!",
+                    format!(
+                        "resizing pipe w/ 'fnctl' failed: stdout pipesize {}, stderr pipesize {}",
+                        pipesize, pipesize1
+                    ),
                 ))
             }
         } else {
@@ -1267,7 +1300,7 @@ impl<'a> GuestCommand<'a> {
 
     pub fn default_disks(&mut self) -> &mut Self {
         if self.guest.disk_config.disk(DiskType::CloudInit).is_some() {
-            self.args(&[
+            self.args([
                 "--disk",
                 format!(
                     "path={}",
@@ -1284,7 +1317,7 @@ impl<'a> GuestCommand<'a> {
                 .as_str(),
             ])
         } else {
-            self.args(&[
+            self.args([
                 "--disk",
                 format!(
                     "path={}",
@@ -1299,7 +1332,7 @@ impl<'a> GuestCommand<'a> {
     }
 
     pub fn default_net(&mut self) -> &mut Self {
-        self.args(&["--net", self.guest.default_net_string().as_str()])
+        self.args(["--net", self.guest.default_net_string().as_str()])
     }
 }
 
@@ -1308,4 +1341,344 @@ pub fn clh_command(cmd: &str) -> String {
         format!("target/x86_64-unknown-linux-gnu/release/{}", cmd),
         |target| format!("target/{}/release/{}", target, cmd),
     )
+}
+
+pub fn parse_iperf3_output(output: &[u8], sender: bool) -> Result<f64, Error> {
+    std::panic::catch_unwind(|| {
+        let s = String::from_utf8_lossy(output);
+        let v: Value = serde_json::from_str(&s).expect("'iperf3' parse error: invalid json output");
+
+        let bps: f64 = if sender {
+            v["end"]["sum_sent"]["bits_per_second"]
+                .as_f64()
+                .expect("'iperf3' parse error: missing entry 'end.sum_sent.bits_per_second'")
+        } else {
+            v["end"]["sum_received"]["bits_per_second"]
+                .as_f64()
+                .expect("'iperf3' parse error: missing entry 'end.sum_received.bits_per_second'")
+        };
+
+        bps
+    })
+    .map_err(|_| {
+        eprintln!(
+            "=============== iperf3 output ===============\n\n{}\n\n===========end============\n\n",
+            String::from_utf8_lossy(output)
+        );
+        Error::Iperf3Parse
+    })
+}
+
+pub enum FioOps {
+    Read,
+    RandomRead,
+    Write,
+    RandomWrite,
+    ReadWrite,
+    RandRW,
+}
+
+impl fmt::Display for FioOps {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            FioOps::Read => write!(f, "read"),
+            FioOps::RandomRead => write!(f, "randread"),
+            FioOps::Write => write!(f, "write"),
+            FioOps::RandomWrite => write!(f, "randwrite"),
+            FioOps::ReadWrite => write!(f, "rw"),
+            FioOps::RandRW => write!(f, "randrw"),
+        }
+    }
+}
+
+pub fn parse_fio_output(output: &str, fio_ops: &FioOps, num_jobs: u32) -> Result<f64, Error> {
+    std::panic::catch_unwind(|| {
+        let v: Value =
+            serde_json::from_str(output).expect("'fio' parse error: invalid json output");
+        let jobs = v["jobs"]
+            .as_array()
+            .expect("'fio' parse error: missing entry 'jobs'");
+        assert_eq!(
+            jobs.len(),
+            num_jobs as usize,
+            "'fio' parse error: Unexpected number of 'fio' jobs."
+        );
+
+        let (read, write) = match fio_ops {
+            FioOps::Read | FioOps::RandomRead => (true, false),
+            FioOps::Write | FioOps::RandomWrite => (false, true),
+            FioOps::ReadWrite | FioOps::RandRW => (true, true),
+        };
+
+        let mut total_bps = 0_f64;
+        for j in jobs {
+            if read {
+                let bytes = j["read"]["io_bytes"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'read.io_bytes'");
+                let runtime = j["read"]["runtime"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'read.runtime'")
+                    as f64
+                    / 1000_f64;
+                total_bps += bytes as f64 / runtime as f64;
+            }
+            if write {
+                let bytes = j["write"]["io_bytes"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'write.io_bytes'");
+                let runtime = j["write"]["runtime"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'write.runtime'")
+                    as f64
+                    / 1000_f64;
+                total_bps += bytes as f64 / runtime as f64;
+            }
+        }
+
+        total_bps
+    })
+    .map_err(|_| {
+        eprintln!(
+            "=============== Fio output ===============\n\n{}\n\n===========end============\n\n",
+            output
+        );
+        Error::FioOutputParse
+    })
+}
+
+pub fn parse_fio_output_iops(output: &str, fio_ops: &FioOps, num_jobs: u32) -> Result<f64, Error> {
+    std::panic::catch_unwind(|| {
+        let v: Value =
+            serde_json::from_str(output).expect("'fio' parse error: invalid json output");
+        let jobs = v["jobs"]
+            .as_array()
+            .expect("'fio' parse error: missing entry 'jobs'");
+        assert_eq!(
+            jobs.len(),
+            num_jobs as usize,
+            "'fio' parse error: Unexpected number of 'fio' jobs."
+        );
+
+        let (read, write) = match fio_ops {
+            FioOps::Read | FioOps::RandomRead => (true, false),
+            FioOps::Write | FioOps::RandomWrite => (false, true),
+            FioOps::ReadWrite | FioOps::RandRW => (true, true),
+        };
+
+        let mut total_iops = 0_f64;
+        for j in jobs {
+            if read {
+                let ios = j["read"]["total_ios"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'read.total_ios'");
+                let runtime = j["read"]["runtime"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'read.runtime'")
+                    as f64
+                    / 1000_f64;
+                total_iops += ios as f64 / runtime as f64;
+            }
+            if write {
+                let ios = j["write"]["total_ios"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'write.total_ios'");
+                let runtime = j["write"]["runtime"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'write.runtime'")
+                    as f64
+                    / 1000_f64;
+                total_iops += ios as f64 / runtime as f64;
+            }
+        }
+
+        total_iops
+    })
+    .map_err(|_| {
+        eprintln!(
+            "=============== Fio output ===============\n\n{}\n\n===========end============\n\n",
+            output
+        );
+        Error::FioOutputParse
+    })
+}
+
+// Wait the child process for a given timeout
+fn child_wait_timeout(child: &mut Child, timeout: u64) -> Result<(), WaitTimeoutError> {
+    match child.wait_timeout(Duration::from_secs(timeout)) {
+        Err(e) => {
+            return Err(WaitTimeoutError::General(e));
+        }
+        Ok(s) => match s {
+            None => {
+                return Err(WaitTimeoutError::Timedout);
+            }
+            Some(s) => {
+                if !s.success() {
+                    return Err(WaitTimeoutError::ExitStatus);
+                }
+            }
+        },
+    }
+
+    Ok(())
+}
+
+pub fn measure_virtio_net_throughput(
+    test_timeout: u32,
+    queue_pairs: u32,
+    guest: &Guest,
+    receive: bool,
+) -> Result<f64, Error> {
+    let default_port = 5201;
+
+    // 1. start the iperf3 server on the guest
+    for n in 0..queue_pairs {
+        guest.ssh_command(&format!("iperf3 -s -p {} -D", default_port + n))?;
+    }
+
+    thread::sleep(Duration::new(1, 0));
+
+    // 2. start the iperf3 client on host to measure RX through-put
+    let mut clients = Vec::new();
+    for n in 0..queue_pairs {
+        let mut cmd = Command::new("iperf3");
+        cmd.args([
+            "-J", // Output in JSON format
+            "-c",
+            &guest.network.guest_ip,
+            "-p",
+            &format!("{}", default_port + n),
+            "-t",
+            &format!("{}", test_timeout),
+        ]);
+        // For measuring the guest transmit throughput (as a sender),
+        // use reverse mode of the iperf3 client on the host
+        if !receive {
+            cmd.args(["-R"]);
+        }
+        let client = cmd
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(Error::Spawn)?;
+
+        clients.push(client);
+    }
+
+    let mut err: Option<Error> = None;
+    let mut bps = Vec::new();
+    let mut failed = false;
+    for c in clients {
+        let mut c = c;
+        if let Err(e) = child_wait_timeout(&mut c, test_timeout as u64 + 5) {
+            err = Some(Error::WaitTimeout(e));
+            failed = true;
+        }
+
+        if !failed {
+            // Safe to unwrap as we know the child has terminated succesffully
+            let output = c.wait_with_output().unwrap();
+            bps.push(parse_iperf3_output(&output.stdout, receive)?);
+        } else {
+            let _ = c.kill();
+            let output = c.wait_with_output().unwrap();
+            println!(
+                "=============== Client output [Error] ===============\n\n{}\n\n===========end============\n\n",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    if let Some(e) = err {
+        Err(e)
+    } else {
+        Ok(bps.iter().sum())
+    }
+}
+
+pub fn parse_ethr_latency_output(output: &[u8]) -> Result<Vec<f64>, Error> {
+    std::panic::catch_unwind(|| {
+        let s = String::from_utf8_lossy(output);
+        let mut latency = Vec::new();
+        for l in s.lines() {
+            let v: Value = serde_json::from_str(l).expect("'ethr' parse error: invalid json line");
+            // Skip header/summary lines
+            if let Some(avg) = v["Avg"].as_str() {
+                // Assume the latency unit is always "us"
+                latency.push(
+                    avg.split("us").collect::<Vec<&str>>()[0]
+                        .parse::<f64>()
+                        .expect("'ethr' parse error: invalid 'Avg' entry"),
+                );
+            }
+        }
+
+        assert!(
+            !latency.is_empty(),
+            "'ethr' parse error: no valid latency data found"
+        );
+
+        latency
+    })
+    .map_err(|_| {
+        eprintln!(
+            "=============== ethr output ===============\n\n{}\n\n===========end============\n\n",
+            String::from_utf8_lossy(output)
+        );
+        Error::EthrLogParse
+    })
+}
+
+pub fn measure_virtio_net_latency(guest: &Guest, test_timeout: u32) -> Result<Vec<f64>, Error> {
+    // copy the 'ethr' tool to the guest image
+    let ethr_path = "/usr/local/bin/ethr";
+    let ethr_remote_path = "/tmp/ethr";
+    scp_to_guest(
+        Path::new(ethr_path),
+        Path::new(ethr_remote_path),
+        &guest.network.guest_ip,
+        //DEFAULT_SSH_RETRIES,
+        1,
+        DEFAULT_SSH_TIMEOUT,
+    )?;
+
+    // Start the ethr server on the guest
+    guest.ssh_command(&format!("{} -s &> /dev/null &", ethr_remote_path))?;
+
+    thread::sleep(Duration::new(10, 0));
+
+    // Start the ethr client on the host
+    let log_file = guest
+        .tmp_dir
+        .as_path()
+        .join("ethr.client.log")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut c = Command::new(ethr_path)
+        .args([
+            "-c",
+            &guest.network.guest_ip,
+            "-t",
+            "l",
+            "-o",
+            &log_file, // file output is JSON format
+            "-d",
+            &format!("{}s", test_timeout),
+        ])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(Error::Spawn)?;
+
+    if let Err(e) = child_wait_timeout(&mut c, test_timeout as u64 + 5).map_err(Error::WaitTimeout)
+    {
+        let _ = c.kill();
+        return Err(e);
+    }
+
+    // Parse the ethr latency test output
+    let content = fs::read(log_file).map_err(Error::EthrLogFile)?;
+    parse_ethr_latency_output(&content)
 }

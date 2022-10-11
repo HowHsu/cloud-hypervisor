@@ -11,8 +11,10 @@ use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::GuestMemoryMmap;
 use crate::VirtioInterrupt;
+use anyhow::anyhow;
 use libc::{EFD_NONBLOCK, TIOCGWINSZ};
 use seccompiler::SeccompAction;
+use serial_buffer::SerialBuffer;
 use std::cmp;
 use std::collections::VecDeque;
 use std::fs::File;
@@ -24,8 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use virtio_queue::Queue;
-use vm_memory::{ByteValued, Bytes, GuestMemoryAtomic};
+use virtio_queue::{Queue, QueueOwnedT, QueueT};
+use vm_memory::{ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vm_virtio::{AccessPlatform, Translatable};
@@ -74,7 +76,8 @@ impl Default for VirtioConsoleConfig {
 unsafe impl ByteValued for VirtioConsoleConfig {}
 
 struct ConsoleEpollHandler {
-    queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    queues: Vec<Queue>,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     in_buffer: Arc<Mutex<VecDeque<u8>>>,
     resizer: Arc<ConsoleResizer>,
@@ -87,11 +90,15 @@ struct ConsoleEpollHandler {
     kill_evt: EventFd,
     pause_evt: EventFd,
     access_platform: Option<Arc<dyn AccessPlatform>>,
+    out: Option<Box<dyn Write + Send>>,
+    write_out: Option<Arc<AtomicBool>>,
+    file_event_registered: bool,
 }
 
 pub enum Endpoint {
     File(File),
     FilePair(File, File),
+    PtyPair(File, File),
     Null,
 }
 
@@ -100,6 +107,7 @@ impl Endpoint {
         match self {
             Self::File(f) => Some(f),
             Self::FilePair(f, _) => Some(f),
+            Self::PtyPair(f, _) => Some(f),
             Self::Null => None,
         }
     }
@@ -108,8 +116,13 @@ impl Endpoint {
         match self {
             Self::File(_) => None,
             Self::FilePair(_, f) => Some(f),
+            Self::PtyPair(_, f) => Some(f),
             Self::Null => None,
         }
+    }
+
+    fn is_pty(&self) -> bool {
+        matches!(self, Self::PtyPair(_, _))
     }
 }
 
@@ -120,12 +133,68 @@ impl Clone for Endpoint {
             Self::FilePair(f_out, f_in) => {
                 Self::FilePair(f_out.try_clone().unwrap(), f_in.try_clone().unwrap())
             }
+            Self::PtyPair(f_out, f_in) => {
+                Self::PtyPair(f_out.try_clone().unwrap(), f_in.try_clone().unwrap())
+            }
             Self::Null => Self::Null,
         }
     }
 }
 
 impl ConsoleEpollHandler {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        queues: Vec<Queue>,
+        interrupt_cb: Arc<dyn VirtioInterrupt>,
+        in_buffer: Arc<Mutex<VecDeque<u8>>>,
+        resizer: Arc<ConsoleResizer>,
+        endpoint: Endpoint,
+        input_queue_evt: EventFd,
+        output_queue_evt: EventFd,
+        input_evt: EventFd,
+        config_evt: EventFd,
+        resize_pipe: Option<File>,
+        kill_evt: EventFd,
+        pause_evt: EventFd,
+        access_platform: Option<Arc<dyn AccessPlatform>>,
+    ) -> Self {
+        let out_file = endpoint.out_file();
+        let (out, write_out) = if let Some(out_file) = out_file {
+            let writer = out_file.try_clone().unwrap();
+            if endpoint.is_pty() {
+                let pty_write_out = Arc::new(AtomicBool::new(false));
+                let write_out = Some(pty_write_out.clone());
+                let buffer = SerialBuffer::new(Box::new(writer), pty_write_out);
+                (Some(Box::new(buffer) as Box<dyn Write + Send>), write_out)
+            } else {
+                (Some(Box::new(writer) as Box<dyn Write + Send>), None)
+            }
+        } else {
+            (None, None)
+        };
+
+        ConsoleEpollHandler {
+            mem,
+            queues,
+            interrupt_cb,
+            in_buffer,
+            resizer,
+            endpoint,
+            input_queue_evt,
+            output_queue_evt,
+            input_evt,
+            config_evt,
+            resize_pipe,
+            kill_evt,
+            pause_evt,
+            access_platform,
+            out,
+            write_out,
+            file_event_registered: false,
+        }
+    }
+
     /*
      * Each port of virtio console device has one receive
      * queue. One or more empty buffers are placed by the
@@ -135,15 +204,13 @@ impl ConsoleEpollHandler {
     fn process_input_queue(&mut self) -> bool {
         let mut in_buffer = self.in_buffer.lock().unwrap();
         let recv_queue = &mut self.queues[0]; //receiveq
-        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        let mut used_count = 0;
+        let mut used_descs = false;
 
         if in_buffer.is_empty() {
             return false;
         }
 
-        let mut avail_iter = recv_queue.iter().unwrap();
-        for mut desc_chain in &mut avail_iter {
+        while let Some(mut desc_chain) = recv_queue.pop_descriptor_chain(self.mem.memory()) {
             let desc = desc_chain.next().unwrap();
             let len = cmp::min(desc.len() as u32, in_buffer.len() as u32);
             let source_slice = in_buffer.drain(..len as usize).collect::<Vec<u8>>();
@@ -154,23 +221,21 @@ impl ConsoleEpollHandler {
                     .translate_gva(self.access_platform.as_ref(), desc.len() as usize),
             ) {
                 error!("Failed to write slice: {:?}", e);
-                avail_iter.go_to_previous_position();
+                recv_queue.go_to_previous_position();
                 break;
             }
 
-            used_desc_heads[used_count] = (desc_chain.head_index(), len);
-            used_count += 1;
+            recv_queue
+                .add_used(desc_chain.memory(), desc_chain.head_index(), len)
+                .unwrap();
+            used_descs = true;
 
             if in_buffer.is_empty() {
                 break;
             }
         }
 
-        for &(desc_index, len) in &used_desc_heads[..used_count] {
-            recv_queue.add_used(desc_index, len).unwrap();
-        }
-
-        used_count > 0
+        used_descs
     }
 
     /*
@@ -182,12 +247,11 @@ impl ConsoleEpollHandler {
      */
     fn process_output_queue(&mut self) -> bool {
         let trans_queue = &mut self.queues[1]; //transmitq
-        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        let mut used_count = 0;
+        let mut used_descs = false;
 
-        for mut desc_chain in trans_queue.iter().unwrap() {
+        while let Some(mut desc_chain) = trans_queue.pop_descriptor_chain(self.mem.memory()) {
             let desc = desc_chain.next().unwrap();
-            if let Some(ref mut out) = self.endpoint.out_file() {
+            if let Some(out) = &mut self.out {
                 let _ = desc_chain.memory().write_to(
                     desc.addr()
                         .translate_gva(self.access_platform.as_ref(), desc.len() as usize),
@@ -196,14 +260,13 @@ impl ConsoleEpollHandler {
                 );
                 let _ = out.flush();
             }
-            used_desc_heads[used_count] = (desc_chain.head_index(), desc.len());
-            used_count += 1;
+            trans_queue
+                .add_used(desc_chain.memory(), desc_chain.head_index(), desc.len())
+                .unwrap();
+            used_descs = true;
         }
 
-        for &(desc_index, len) in &used_desc_heads[..used_count] {
-            trans_queue.add_used(desc_index, len).unwrap();
-        }
-        used_count > 0
+        used_descs
     }
 
     fn signal_used_queue(&self, queue_index: u16) -> result::Result<(), DeviceError> {
@@ -229,90 +292,235 @@ impl ConsoleEpollHandler {
             helper.add_event(resize_pipe.as_raw_fd(), RESIZE_EVENT)?;
         }
         if let Some(in_file) = self.endpoint.in_file() {
-            helper.add_event(in_file.as_raw_fd(), FILE_EVENT)?;
+            let mut events = epoll::Events::EPOLLIN;
+            if self.endpoint.is_pty() {
+                events |= epoll::Events::EPOLLONESHOT;
+            }
+            helper.add_event_custom(in_file.as_raw_fd(), FILE_EVENT, events)?;
+            self.file_event_registered = true;
         }
-        helper.run(paused, paused_sync, self)?;
+
+        // In case of PTY, we want to be able to detect a connection on the
+        // other end of the PTY. This is done by detecting there's no event
+        // triggered on the epoll, which is the reason why we want the
+        // epoll_wait() function to return after the timeout expired.
+        // In case of TTY, we don't expect to detect such behavior, which is
+        // why we can afford to block until an actual event is triggered.
+        let (timeout, enable_event_list) = if self.endpoint.is_pty() {
+            (500, true)
+        } else {
+            (-1, false)
+        };
+        helper.run_with_timeout(paused, paused_sync, self, timeout, enable_event_list)?;
+
+        Ok(())
+    }
+
+    // This function should be called when the other end of the PTY is
+    // connected. It verifies if this is the first time it's been invoked
+    // after the connection happened, and if that's the case it flushes
+    // all output from the console to the PTY. Otherwise, it's a no-op.
+    fn trigger_pty_flush(&mut self) -> result::Result<(), anyhow::Error> {
+        if let (Some(pty_write_out), Some(out)) = (&self.write_out, &mut self.out) {
+            if pty_write_out.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            pty_write_out.store(true, Ordering::Release);
+            out.flush()
+                .map_err(|e| anyhow!("Failed to flush PTY: {:?}", e))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn register_file_event(
+        &mut self,
+        helper: &mut EpollHelper,
+    ) -> result::Result<(), EpollHelperError> {
+        if self.file_event_registered {
+            return Ok(());
+        }
+
+        // Re-arm the file event.
+        helper.mod_event_custom(
+            self.endpoint.in_file().unwrap().as_raw_fd(),
+            FILE_EVENT,
+            epoll::Events::EPOLLIN | epoll::Events::EPOLLONESHOT,
+        )?;
+        self.file_event_registered = true;
 
         Ok(())
     }
 }
 
 impl EpollHelperHandler for ConsoleEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
+
         match ev_type {
             INPUT_QUEUE_EVENT => {
-                if let Err(e) = self.input_queue_evt.read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                } else if self.process_input_queue() {
-                    if let Err(e) = self.signal_used_queue(0) {
-                        error!("Failed to signal used queue: {:?}", e);
-                        return true;
-                    }
+                self.input_queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
+                if self.process_input_queue() {
+                    self.signal_used_queue(0).map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             OUTPUT_QUEUE_EVENT => {
-                if let Err(e) = self.output_queue_evt.read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                } else if self.process_output_queue() {
-                    if let Err(e) = self.signal_used_queue(1) {
-                        error!("Failed to signal used queue: {:?}", e);
-                        return true;
-                    }
+                self.output_queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
+                if self.process_output_queue() {
+                    self.signal_used_queue(1).map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             INPUT_EVENT => {
-                if let Err(e) = self.input_evt.read() {
-                    error!("Failed to get input event: {:?}", e);
-                    return true;
-                } else if self.process_input_queue() {
-                    if let Err(e) = self.signal_used_queue(0) {
-                        error!("Failed to signal used queue: {:?}", e);
-                        return true;
-                    }
+                self.input_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get input event: {:?}", e))
+                })?;
+                if self.process_input_queue() {
+                    self.signal_used_queue(0).map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             CONFIG_EVENT => {
-                if let Err(e) = self.config_evt.read() {
-                    error!("Failed to get config event: {:?}", e);
-                    return true;
-                } else if let Err(e) = self.interrupt_cb.trigger(VirtioInterruptType::Config) {
-                    error!("Failed to signal console driver: {:?}", e);
-                    return true;
-                }
+                self.config_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get config event: {:?}", e))
+                })?;
+                self.interrupt_cb
+                    .trigger(VirtioInterruptType::Config)
+                    .map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal console driver: {:?}",
+                            e
+                        ))
+                    })?;
             }
             RESIZE_EVENT => {
-                if let Err(e) = self.resize_pipe.as_ref().unwrap().read_exact(&mut [0]) {
-                    error!("Failed to get resize event: {:?}", e);
-                    return true;
-                }
-
+                self.resize_pipe
+                    .as_ref()
+                    .unwrap()
+                    .read_exact(&mut [0])
+                    .map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to get resize event: {:?}",
+                            e
+                        ))
+                    })?;
                 self.resizer.update_console_size();
             }
             FILE_EVENT => {
-                let mut input = [0u8; 64];
-                if let Some(ref mut in_file) = self.endpoint.in_file() {
-                    if let Ok(count) = in_file.read(&mut input) {
-                        let mut in_buffer = self.in_buffer.lock().unwrap();
-                        in_buffer.extend(&input[..count]);
-                    }
-
-                    if self.process_input_queue() {
-                        if let Err(e) = self.signal_used_queue(0) {
-                            error!("Failed to signal used queue: {:?}", e);
-                            return true;
+                if event.events & libc::EPOLLIN as u32 != 0 {
+                    let mut input = [0u8; 64];
+                    if let Some(ref mut in_file) = self.endpoint.in_file() {
+                        if let Ok(count) = in_file.read(&mut input) {
+                            let mut in_buffer = self.in_buffer.lock().unwrap();
+                            in_buffer.extend(&input[..count]);
                         }
+
+                        if self.process_input_queue() {
+                            self.signal_used_queue(0).map_err(|e| {
+                                EpollHelperError::HandleEvent(anyhow!(
+                                    "Failed to signal used queue: {:?}",
+                                    e
+                                ))
+                            })?;
+                        }
+                    }
+                }
+                if self.endpoint.is_pty() {
+                    self.file_event_registered = false;
+                    if event.events & libc::EPOLLHUP as u32 != 0 {
+                        if let Some(pty_write_out) = &self.write_out {
+                            if pty_write_out.load(Ordering::Acquire) {
+                                pty_write_out.store(false, Ordering::Release);
+                            }
+                        }
+                    } else {
+                        // If the EPOLLHUP flag is not up on the associated event, we
+                        // can assume the other end of the PTY is connected and therefore
+                        // we can flush the output of the serial to it.
+                        self.trigger_pty_flush()
+                            .map_err(EpollHelperError::HandleTimeout)?;
+
+                        self.register_file_event(helper)?;
                     }
                 }
             }
             _ => {
-                error!("Unknown event for virtio-console");
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unknown event for virtio-console"
+                )));
             }
         }
-        false
+        Ok(())
+    }
+
+    // This function will be invoked whenever the timeout is reached before
+    // any other event was triggered while waiting for the epoll.
+    fn handle_timeout(&mut self, helper: &mut EpollHelper) -> Result<(), EpollHelperError> {
+        if !self.endpoint.is_pty() {
+            return Ok(());
+        }
+
+        if self.file_event_registered {
+            // This very specific case happens when the console is connected
+            // to a PTY. We know EPOLLHUP is always present when there's nothing
+            // connected at the other end of the PTY. That's why getting no event
+            // means we can flush the output of the console through the PTY.
+            self.trigger_pty_flush()
+                .map_err(EpollHelperError::HandleTimeout)?;
+        }
+
+        // Every time we hit the timeout, let's register the FILE_EVENT to give
+        // us a chance to catch a possible event that might have been triggered.
+        self.register_file_event(helper)
+    }
+
+    // This function returns the full list of events found on the epoll before
+    // iterating through it calling handle_event(). It allows the detection of
+    // the PTY connection even when the timeout is not being triggered, which
+    // happens when there are other events preventing the timeout from being
+    // reached. This is an additional way of detecting a PTY connection.
+    fn event_list(
+        &mut self,
+        helper: &mut EpollHelper,
+        events: &[epoll::Event],
+    ) -> Result<(), EpollHelperError> {
+        if self.file_event_registered {
+            for event in events {
+                if event.data as u16 == FILE_EVENT && (event.events & libc::EPOLLHUP as u32) != 0 {
+                    return Ok(());
+                }
+            }
+
+            // This very specific case happens when the console is connected
+            // to a PTY. We know EPOLLHUP is always present when there's nothing
+            // connected at the other end of the PTY. That's why getting no event
+            // means we can flush the output of the console through the PTY.
+            self.trigger_pty_flush()
+                .map_err(EpollHelperError::HandleTimeout)?;
+        }
+
+        self.register_file_event(helper)
     }
 }
 
@@ -488,12 +696,11 @@ impl VirtioDevice for Console {
 
     fn activate(
         &mut self,
-        _mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        mut queue_evts: Vec<EventFd>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         self.resizer
             .acked_features
             .store(self.common.acked_features, Ordering::Relaxed);
@@ -507,21 +714,30 @@ impl VirtioDevice for Console {
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
         let input_evt = EventFd::new(EFD_NONBLOCK).unwrap();
 
-        let mut handler = ConsoleEpollHandler {
-            queues,
+        let mut virtqueues = Vec::new();
+        let (_, queue, queue_evt) = queues.remove(0);
+        virtqueues.push(queue);
+        let input_queue_evt = queue_evt;
+        let (_, queue, queue_evt) = queues.remove(0);
+        virtqueues.push(queue);
+        let output_queue_evt = queue_evt;
+
+        let mut handler = ConsoleEpollHandler::new(
+            mem,
+            virtqueues,
             interrupt_cb,
-            in_buffer: self.in_buffer.clone(),
-            endpoint: self.endpoint.clone(),
-            input_queue_evt: queue_evts.remove(0),
-            output_queue_evt: queue_evts.remove(0),
+            self.in_buffer.clone(),
+            Arc::clone(&self.resizer),
+            self.endpoint.clone(),
+            input_queue_evt,
+            output_queue_evt,
             input_evt,
-            config_evt: self.resizer.config_evt.try_clone().unwrap(),
-            resize_pipe: self.resize_pipe.as_ref().map(|p| p.try_clone().unwrap()),
-            resizer: Arc::clone(&self.resizer),
+            self.resizer.config_evt.try_clone().unwrap(),
+            self.resize_pipe.as_ref().map(|p| p.try_clone().unwrap()),
             kill_evt,
             pause_evt,
-            access_platform: self.common.access_platform.clone(),
-        };
+            self.common.access_platform.clone(),
+        );
 
         let paused = self.common.paused.clone();
         let paused_sync = self.common.paused_sync.clone();
@@ -533,11 +749,7 @@ impl VirtioDevice for Console {
             Thread::VirtioConsole,
             &mut epoll_threads,
             &self.exit_evt,
-            move || {
-                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                    error!("Error running worker: {:?}", e);
-                }
-            },
+            move || handler.run(paused, paused_sync.unwrap()),
         )?;
 
         self.common.epoll_threads = Some(epoll_threads);

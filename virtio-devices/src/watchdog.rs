@@ -23,10 +23,11 @@ use std::result;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Instant;
+use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use virtio_queue::Queue;
-use vm_memory::{Bytes, GuestMemoryAtomic};
+use virtio_queue::{Queue, QueueT};
+use vm_memory::{Bytes, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::VersionMapped;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
@@ -46,8 +47,19 @@ const WATCHDOG_TIMER_INTERVAL: i64 = 15;
 // Number of seconds since last ping to trigger reboot
 const WATCHDOG_TIMEOUT: u64 = WATCHDOG_TIMER_INTERVAL as u64 + 5;
 
+#[derive(Error, Debug)]
+enum Error {
+    #[error("Error programming timer fd: {0}")]
+    TimerfdSetup(io::Error),
+    #[error("Descriptor chain too short")]
+    DescriptorChainTooShort,
+    #[error("Failed adding used index: {0}")]
+    QueueAddUsed(virtio_queue::Error),
+}
+
 struct WatchdogEpollHandler {
-    queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    queue: Queue,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     queue_evt: EventFd,
     kill_evt: EventFd,
@@ -60,12 +72,11 @@ struct WatchdogEpollHandler {
 impl WatchdogEpollHandler {
     // The main queue is very simple - the driver "pings" the device by passing it a (write-only)
     // descriptor. In response the device writes a 1 into the descriptor and returns it to the driver
-    fn process_queue(&mut self) -> bool {
-        let queue = &mut self.queues[0];
-        let mut used_desc_heads = [(0, 0); QUEUE_SIZE as usize];
-        let mut used_count = 0;
-        for mut desc_chain in queue.iter().unwrap() {
-            let desc = desc_chain.next().unwrap();
+    fn process_queue(&mut self) -> result::Result<bool, Error> {
+        let queue = &mut self.queue;
+        let mut used_descs = false;
+        while let Some(mut desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) {
+            let desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
 
             let mut len = 0;
 
@@ -77,21 +88,19 @@ impl WatchdogEpollHandler {
                         "First ping received. Starting timer (every {} seconds)",
                         WATCHDOG_TIMER_INTERVAL
                     );
-                    if let Err(e) = timerfd_setup(&self.timer, WATCHDOG_TIMER_INTERVAL) {
-                        error!("Error programming timer fd: {:?}", e);
-                    }
+                    timerfd_setup(&self.timer, WATCHDOG_TIMER_INTERVAL)
+                        .map_err(Error::TimerfdSetup)?;
                 }
                 self.last_ping_time.lock().unwrap().replace(Instant::now());
             }
 
-            used_desc_heads[used_count] = (desc_chain.head_index(), len);
-            used_count += 1;
+            queue
+                .add_used(desc_chain.memory(), desc_chain.head_index(), len)
+                .map_err(Error::QueueAddUsed)?;
+            used_descs = true;
         }
 
-        for &(desc_index, len) in &used_desc_heads[..used_count] {
-            queue.add_used(desc_index, len).unwrap();
-        }
-        used_count > 0
+        Ok(used_descs)
     }
 
     fn signal_used_queue(&self) -> result::Result<(), DeviceError> {
@@ -118,28 +127,38 @@ impl WatchdogEpollHandler {
 }
 
 impl EpollHelperHandler for WatchdogEpollHandler {
-    fn handle_event(&mut self, _helper: &mut EpollHelper, event: &epoll::Event) -> bool {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
         let ev_type = event.data as u16;
         match ev_type {
             QUEUE_AVAIL_EVENT => {
-                if let Err(e) = self.queue_evt.read() {
-                    error!("Failed to get queue event: {:?}", e);
-                    return true;
-                } else if self.process_queue() {
-                    if let Err(e) = self.signal_used_queue() {
-                        error!("Failed to signal used queue: {:?}", e);
-                        return true;
-                    }
+                self.queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
+                })?;
+
+                let needs_notification = self.process_queue().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to process queue : {:?}", e))
+                })?;
+                if needs_notification {
+                    self.signal_used_queue().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to signal used queue: {:?}",
+                            e
+                        ))
+                    })?;
                 }
             }
             TIMER_EXPIRED_EVENT => {
                 // When reading from the timerfd you get 8 bytes indicating
                 // the number of times this event has elapsed since the last read.
                 let mut buf = vec![0; 8];
-                if let Err(e) = self.timer.read_exact(&mut buf) {
-                    error!("Error reading from timer fd: {:}", e);
-                    return true;
-                }
+                self.timer.read_exact(&mut buf).map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Error reading from timer fd: {:}", e))
+                })?;
+
                 if let Some(last_ping_time) = self.last_ping_time.lock().unwrap().as_ref() {
                     let now = Instant::now();
                     let gap = now.duration_since(*last_ping_time).as_secs();
@@ -148,14 +167,15 @@ impl EpollHelperHandler for WatchdogEpollHandler {
                         self.reset_evt.write(1).ok();
                     }
                 }
-                return false;
             }
             _ => {
-                error!("Unexpected event: {}", ev_type);
-                return true;
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unexpected event: {}",
+                    ev_type
+                )));
             }
         }
-        false
+        Ok(())
     }
 }
 
@@ -228,6 +248,11 @@ impl Watchdog {
             self.last_ping_time.lock().unwrap().replace(Instant::now());
         }
     }
+
+    #[cfg(fuzzing)]
+    pub fn wait_for_epoll_threads(&mut self) {
+        self.common.wait_for_epoll_threads();
+    }
 }
 
 impl Drop for Watchdog {
@@ -289,12 +314,11 @@ impl VirtioDevice for Watchdog {
 
     fn activate(
         &mut self,
-        _mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
-        queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
-        mut queue_evts: Vec<EventFd>,
+        mut queues: Vec<(usize, Queue, EventFd)>,
     ) -> ActivateResult {
-        self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
+        self.common.activate(&queues, &interrupt_cb)?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
         let reset_evt = self.reset_evt.try_clone().map_err(|e| {
@@ -307,10 +331,13 @@ impl VirtioDevice for Watchdog {
             ActivateError::BadActivate
         })?;
 
+        let (_, queue, queue_evt) = queues.remove(0);
+
         let mut handler = WatchdogEpollHandler {
-            queues,
+            mem,
+            queue,
             interrupt_cb,
-            queue_evt: queue_evts.remove(0),
+            queue_evt,
             kill_evt,
             pause_evt,
             timer,
@@ -328,11 +355,7 @@ impl VirtioDevice for Watchdog {
             Thread::VirtioWatchdog,
             &mut epoll_threads,
             &self.exit_evt,
-            move || {
-                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
-                    error!("Error running worker: {:?}", e);
-                }
-            },
+            move || handler.run(paused, paused_sync.unwrap()),
         )?;
 
         self.common.epoll_threads = Some(epoll_threads);

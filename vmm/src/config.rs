@@ -153,6 +153,9 @@ pub enum ValidationError {
     /// CPU Hotplug is not permitted with TDX
     #[cfg(feature = "tdx")]
     TdxNoCpuHotplug,
+    /// Missing firmware for TDX
+    #[cfg(feature = "tdx")]
+    TdxFirmwareMissing,
     /// Insuffient vCPUs for queues
     TooManyQueues,
     /// Need shared memory for vfio-user
@@ -175,6 +178,10 @@ pub enum ValidationError {
     InvalidIdentifier(String),
     /// Placing the device behind a virtual IOMMU is not supported
     IommuNotSupported,
+    /// Duplicated device path (device added twice)
+    DuplicateDevicePath(String),
+    /// Provided MTU is lower than what the VIRTIO specification expects
+    InvalidMtu(u16),
 }
 
 type ValidationResult<T> = std::result::Result<T, ValidationError>;
@@ -216,6 +223,10 @@ impl fmt::Display for ValidationError {
             #[cfg(feature = "tdx")]
             TdxNoCpuHotplug => {
                 write!(f, "CPU hotplug is not permitted with TDX")
+            }
+            #[cfg(feature = "tdx")]
+            TdxFirmwareMissing => {
+                write!(f, "No TDX firmware specified")
             }
             TooManyQueues => {
                 write!(f, "Number of vCPUs is insufficient for number of queues")
@@ -269,6 +280,14 @@ impl fmt::Display for ValidationError {
             }
             IommuNotSupported => {
                 write!(f, "Device does not support being placed behind IOMMU")
+            }
+            DuplicateDevicePath(p) => write!(f, "Duplicated device path: {}", p),
+            &InvalidMtu(mtu) => {
+                write!(
+                    f,
+                    "Provided MTU {} is lower than 1280 (expected by VIRTIO specification)",
+                    mtu
+                )
             }
         }
     }
@@ -340,6 +359,7 @@ pub struct VmParams<'a> {
     pub cpus: &'a str,
     pub memory: &'a str,
     pub memory_zones: Option<Vec<&'a str>>,
+    pub firmware: Option<&'a str>,
     pub kernel: Option<&'a str>,
     pub initramfs: Option<&'a str>,
     pub cmdline: Option<&'a str>,
@@ -359,9 +379,7 @@ pub struct VmParams<'a> {
     pub sgx_epc: Option<Vec<&'a str>>,
     pub numa: Option<Vec<&'a str>>,
     pub watchdog: bool,
-    #[cfg(feature = "tdx")]
-    pub tdx: Option<&'a str>,
-    #[cfg(feature = "gdb")]
+    #[cfg(feature = "guest_debug")]
     pub gdb: bool,
     pub platform: Option<&'a str>,
 }
@@ -374,11 +392,10 @@ impl<'a> VmParams<'a> {
         let memory_zones: Option<Vec<&str>> = args.values_of("memory-zone").map(|x| x.collect());
         let rng = args.value_of("rng").unwrap();
         let serial = args.value_of("serial").unwrap();
-
+        let firmware = args.value_of("firmware");
         let kernel = args.value_of("kernel");
         let initramfs = args.value_of("initramfs");
         let cmdline = args.value_of("cmdline");
-
         let disks: Option<Vec<&str>> = args.values_of("disk").map(|x| x.collect());
         let net: Option<Vec<&str>> = args.values_of("net").map(|x| x.collect());
         let console = args.value_of("console").unwrap();
@@ -394,14 +411,13 @@ impl<'a> VmParams<'a> {
         let numa: Option<Vec<&str>> = args.values_of("numa").map(|x| x.collect());
         let watchdog = args.is_present("watchdog");
         let platform = args.value_of("platform");
-        #[cfg(feature = "tdx")]
-        let tdx = args.value_of("tdx");
-        #[cfg(feature = "gdb")]
+        #[cfg(feature = "guest_debug")]
         let gdb = args.is_present("gdb");
         VmParams {
             cpus,
             memory,
             memory_zones,
+            firmware,
             kernel,
             initramfs,
             cmdline,
@@ -421,9 +437,7 @@ impl<'a> VmParams<'a> {
             sgx_epc,
             numa,
             watchdog,
-            #[cfg(feature = "tdx")]
-            tdx,
-            #[cfg(feature = "gdb")]
+            #[cfg(feature = "guest_debug")]
             gdb,
             platform,
         }
@@ -467,7 +481,8 @@ pub struct CpuAffinity {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CpuFeatures {
-    #[cfg(all(feature = "amx", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
+    #[serde(default)]
     pub amx: bool,
 }
 
@@ -587,7 +602,7 @@ impl CpusConfig {
         let mut features = CpuFeatures::default();
         for s in features_list.0 {
             match <std::string::String as AsRef<str>>::as_ref(&s) {
-                #[cfg(all(feature = "amx", target_arch = "x86_64"))]
+                #[cfg(target_arch = "x86_64")]
                 "amx" => {
                     features.amx = true;
                     Ok(())
@@ -634,14 +649,26 @@ pub struct PlatformConfig {
     pub iommu_segments: Option<Vec<u16>>,
     #[serde(default)]
     pub serial_number: Option<String>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub oem_strings: Option<Vec<String>>,
+    #[cfg(feature = "tdx")]
+    #[serde(default)]
+    pub tdx: bool,
 }
 
 impl PlatformConfig {
     pub fn parse(platform: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
-        parser.add("num_pci_segments");
-        parser.add("iommu_segments");
-        parser.add("serial_number");
+        parser
+            .add("num_pci_segments")
+            .add("iommu_segments")
+            .add("serial_number")
+            .add("uuid")
+            .add("oem_strings");
+        #[cfg(feature = "tdx")]
+        parser.add("tdx");
         parser.parse(platform).map_err(Error::ParsePlatform)?;
 
         let num_pci_segments: u16 = parser
@@ -655,10 +682,25 @@ impl PlatformConfig {
         let serial_number = parser
             .convert("serial_number")
             .map_err(Error::ParsePlatform)?;
+        let uuid = parser.convert("uuid").map_err(Error::ParsePlatform)?;
+        let oem_strings = parser
+            .convert::<StringList>("oem_strings")
+            .map_err(Error::ParsePlatform)?
+            .map(|v| v.0);
+        #[cfg(feature = "tdx")]
+        let tdx = parser
+            .convert::<Toggle>("tdx")
+            .map_err(Error::ParsePlatform)?
+            .unwrap_or(Toggle(false))
+            .0;
         Ok(PlatformConfig {
             num_pci_segments,
             iommu_segments,
             serial_number,
+            uuid,
+            oem_strings,
+            #[cfg(feature = "tdx")]
+            tdx,
         })
     }
 
@@ -687,6 +729,10 @@ impl Default for PlatformConfig {
             num_pci_segments: DEFAULT_NUM_PCI_SEGMENTS,
             iommu_segments: None,
             serial_number: None,
+            uuid: None,
+            oem_strings: None,
+            #[cfg(feature = "tdx")]
+            tdx: false,
         }
     }
 }
@@ -959,8 +1005,6 @@ pub struct DiskConfig {
     #[serde(default)]
     pub vhost_user: bool,
     pub vhost_socket: Option<String>,
-    #[serde(default = "default_diskconfig_poll_queue")]
-    pub poll_queue: bool,
     #[serde(default)]
     pub rate_limiter_config: Option<RateLimiterConfig>,
     #[serde(default)]
@@ -980,10 +1024,6 @@ fn default_diskconfig_queue_size() -> u16 {
     DEFAULT_QUEUE_SIZE_VUBLK
 }
 
-fn default_diskconfig_poll_queue() -> bool {
-    true
-}
-
 impl Default for DiskConfig {
     fn default() -> Self {
         Self {
@@ -995,7 +1035,6 @@ impl Default for DiskConfig {
             queue_size: default_diskconfig_queue_size(),
             vhost_user: false,
             vhost_socket: None,
-            poll_queue: default_diskconfig_poll_queue(),
             id: None,
             disable_io_uring: false,
             rate_limiter_config: None,
@@ -1008,7 +1047,7 @@ impl DiskConfig {
     pub const SYNTAX: &'static str = "Disk parameters \
          \"path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=on|off,\
          num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
-         vhost_user=on|off,socket=<vhost_user_socket_path>,poll_queue=on|off,\
+         vhost_user=on|off,socket=<vhost_user_socket_path>,\
          bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
          ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
          id=<device_id>,pci_segment=<segment_id>\"";
@@ -1024,7 +1063,6 @@ impl DiskConfig {
             .add("num_queues")
             .add("vhost_user")
             .add("socket")
-            .add("poll_queue")
             .add("bw_size")
             .add("bw_one_time_burst")
             .add("bw_refill_time")
@@ -1066,11 +1104,6 @@ impl DiskConfig {
             .unwrap_or(Toggle(false))
             .0;
         let vhost_socket = parser.get("socket");
-        let poll_queue = parser
-            .convert::<Toggle>("poll_queue")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_else(|| Toggle(default_diskconfig_poll_queue()))
-            .0;
         let id = parser.get("id");
         let disable_io_uring = parser
             .convert::<Toggle>("_disable_io_uring")
@@ -1132,10 +1165,6 @@ impl DiskConfig {
             None
         };
 
-        if parser.is_set("poll_queue") && !vhost_user {
-            warn!("poll_queue parameter currently only has effect when used vhost_user=true");
-        }
-
         Ok(DiskConfig {
             path,
             readonly,
@@ -1145,7 +1174,6 @@ impl DiskConfig {
             queue_size,
             vhost_user,
             vhost_socket,
-            poll_queue,
             rate_limiter_config,
             id,
             disable_io_uring,
@@ -1220,6 +1248,8 @@ pub struct NetConfig {
     #[serde(default)]
     pub host_mac: Option<MacAddr>,
     #[serde(default)]
+    pub mtu: Option<u16>,
+    #[serde(default)]
     pub iommu: bool,
     #[serde(default = "default_netconfig_num_queues")]
     pub num_queues: usize,
@@ -1272,6 +1302,7 @@ impl Default for NetConfig {
             mask: default_netconfig_mask(),
             mac: default_netconfig_mac(),
             host_mac: None,
+            mtu: None,
             iommu: false,
             num_queues: default_netconfig_num_queues(),
             queue_size: default_netconfig_queue_size(),
@@ -1303,6 +1334,7 @@ impl NetConfig {
             .add("mask")
             .add("mac")
             .add("host_mac")
+            .add("mtu")
             .add("iommu")
             .add("queue_size")
             .add("num_queues")
@@ -1334,6 +1366,7 @@ impl NetConfig {
             .map_err(Error::ParseNetwork)?
             .unwrap_or_else(default_netconfig_mac);
         let host_mac = parser.convert("host_mac").map_err(Error::ParseNetwork)?;
+        let mtu = parser.convert("mtu").map_err(Error::ParseNetwork)?;
         let iommu = parser
             .convert::<Toggle>("iommu")
             .map_err(Error::ParseNetwork)?
@@ -1423,6 +1456,7 @@ impl NetConfig {
             mask,
             mac,
             host_mac,
+            mtu,
             iommu,
             num_queues,
             queue_size,
@@ -1471,6 +1505,12 @@ impl NetConfig {
                 if iommu_segments.contains(&self.pci_segment) && !self.iommu {
                     return Err(ValidationError::OnIommuSegment(self.pci_segment));
                 }
+            }
+        }
+
+        if let Some(mtu) = self.mtu {
+            if mtu < virtio_devices::net::MIN_MTU {
+                return Err(ValidationError::InvalidMtu(mtu));
             }
         }
 
@@ -2082,26 +2122,6 @@ impl VsockConfig {
     }
 }
 
-#[cfg(feature = "tdx")]
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
-pub struct TdxConfig {
-    pub firmware: PathBuf,
-}
-
-#[cfg(feature = "tdx")]
-impl TdxConfig {
-    pub fn parse(tdx: &str) -> Result<Self> {
-        let mut parser = OptionParser::new();
-        parser.add("firmware");
-        parser.parse(tdx).map_err(Error::ParseTdx)?;
-        let firmware = parser
-            .get("firmware")
-            .map(PathBuf::from)
-            .ok_or(Error::FirmwarePathMissing)?;
-        Ok(TdxConfig { firmware })
-    }
-}
-
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct SgxEpcConfig {
@@ -2248,6 +2268,18 @@ impl RestoreConfig {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PayloadConfig {
+    #[serde(default)]
+    pub firmware: Option<PathBuf>,
+    #[serde(default)]
+    pub kernel: Option<PathBuf>,
+    #[serde(default)]
+    pub cmdline: Option<String>,
+    #[serde(default)]
+    pub initramfs: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VmConfig {
     #[serde(default)]
@@ -2259,6 +2291,8 @@ pub struct VmConfig {
     pub initramfs: Option<InitramfsConfig>,
     #[serde(default)]
     pub cmdline: CmdlineConfig,
+    #[serde(default)]
+    pub payload: Option<PayloadConfig>,
     pub disks: Option<Vec<DiskConfig>>,
     pub net: Option<Vec<NetConfig>>,
     #[serde(default)]
@@ -2281,9 +2315,7 @@ pub struct VmConfig {
     pub numa: Option<Vec<NumaConfig>>,
     #[serde(default)]
     pub watchdog: bool,
-    #[cfg(feature = "tdx")]
-    pub tdx: Option<TdxConfig>,
-    #[cfg(feature = "gdb")]
+    #[cfg(feature = "guest_debug")]
     pub gdb: bool,
     pub platform: Option<PlatformConfig>,
 }
@@ -2312,14 +2344,30 @@ impl VmConfig {
     pub fn validate(&mut self) -> ValidationResult<BTreeSet<String>> {
         let mut id_list = BTreeSet::new();
 
-        #[cfg(not(feature = "tdx"))]
-        self.kernel.as_ref().ok_or(ValidationError::KernelMissing)?;
+        if self.kernel.is_some() {
+            warn!("The \"VmConfig\" members \"kernel\", \"cmdline\" and \"initramfs\" are deprecated. Use \"payload\" member instead.");
+            self.payload = Some(PayloadConfig {
+                kernel: self.kernel.take().map(|k| k.path),
+                cmdline: if self.cmdline.args.is_empty() {
+                    None
+                } else {
+                    Some(self.cmdline.args.drain(..).collect())
+                },
+                initramfs: self.initramfs.take().map(|i| i.path),
+                ..Default::default()
+            })
+        }
+
+        self.payload
+            .as_ref()
+            .ok_or(ValidationError::KernelMissing)?;
 
         #[cfg(feature = "tdx")]
         {
-            let tdx_enabled = self.tdx.is_some();
-            if !tdx_enabled && self.kernel.is_none() {
-                return Err(ValidationError::KernelMissing);
+            let tdx_enabled = self.platform.as_ref().map(|p| p.tdx).unwrap_or(false);
+            // At this point we know payload isn't None.
+            if tdx_enabled && self.payload.as_ref().unwrap().firmware.is_none() {
+                return Err(ValidationError::TdxFirmwareMissing);
             }
             if tdx_enabled && (self.cpus.max_vcpus != self.cpus.boot_vcpus) {
                 return Err(ValidationError::TdxNoCpuHotplug);
@@ -2467,7 +2515,14 @@ impl VmConfig {
         }
 
         if let Some(devices) = &self.devices {
+            let mut device_paths = BTreeSet::new();
             for device in devices {
+                if !device_paths.insert(device.path.to_string_lossy()) {
+                    return Err(ValidationError::DuplicateDevicePath(
+                        device.path.to_string_lossy().to_string(),
+                    ));
+                }
+
                 device.validate(self)?;
                 self.iommu |= device.iommu;
 
@@ -2637,32 +2692,27 @@ impl VmConfig {
             numa = Some(numa_config_list);
         }
 
-        let mut kernel: Option<KernelConfig> = None;
-        if let Some(k) = vm_params.kernel {
-            kernel = Some(KernelConfig {
-                path: PathBuf::from(k),
-            });
-        }
+        let payload = if vm_params.kernel.is_some() || vm_params.firmware.is_some() {
+            Some(PayloadConfig {
+                kernel: vm_params.kernel.map(PathBuf::from),
+                initramfs: vm_params.initramfs.map(PathBuf::from),
+                cmdline: vm_params.cmdline.map(|s| s.to_string()),
+                firmware: vm_params.firmware.map(PathBuf::from),
+            })
+        } else {
+            None
+        };
 
-        let mut initramfs: Option<InitramfsConfig> = None;
-        if let Some(k) = vm_params.initramfs {
-            initramfs = Some(InitramfsConfig {
-                path: PathBuf::from(k),
-            });
-        }
-
-        #[cfg(feature = "tdx")]
-        let tdx = vm_params.tdx.map(TdxConfig::parse).transpose()?;
-
-        #[cfg(feature = "gdb")]
+        #[cfg(feature = "guest_debug")]
         let gdb = vm_params.gdb;
 
         let mut config = VmConfig {
             cpus: CpusConfig::parse(vm_params.cpus)?,
             memory: MemoryConfig::parse(vm_params.memory, vm_params.memory_zones)?,
-            kernel,
-            initramfs,
-            cmdline: CmdlineConfig::parse(vm_params.cmdline)?,
+            kernel: None,
+            initramfs: None,
+            cmdline: CmdlineConfig::default(),
+            payload,
             disks,
             net,
             rng,
@@ -2680,39 +2730,23 @@ impl VmConfig {
             sgx_epc,
             numa,
             watchdog: vm_params.watchdog,
-            #[cfg(feature = "tdx")]
-            tdx,
-            #[cfg(feature = "gdb")]
+            #[cfg(feature = "guest_debug")]
             gdb,
             platform,
         };
         config.validate().map_err(Error::Validation)?;
         Ok(config)
     }
+
+    #[cfg(feature = "tdx")]
+    pub fn is_tdx_enabled(&self) -> bool {
+        self.platform.as_ref().map(|p| p.tdx).unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_option_parser() {
-        let mut parser = OptionParser::new();
-        parser
-            .add("size")
-            .add("mergeable")
-            .add("hotplug_method")
-            .add("hotplug_size");
-
-        assert!(parser.parse("size=128M,hanging_param").is_err());
-        assert!(parser.parse("size=128M,too_many_equals=foo=bar").is_err());
-        assert!(parser.parse("size=128M,file=/dev/shm").is_err());
-        assert!(parser.parse("size=128M").is_ok());
-
-        assert_eq!(parser.get("size"), Some("128M".to_owned()));
-        assert!(!parser.is_set("mergeable"));
-        assert!(parser.is_set("size"));
-    }
 
     #[test]
     fn test_cpu_parsing() -> Result<()> {
@@ -2760,6 +2794,25 @@ mod tests {
                 ..Default::default()
             }
         );
+        assert_eq!(
+            CpusConfig::parse("boot=2,affinity=[0@[0,2],1@[1,3]]")?,
+            CpusConfig {
+                boot_vcpus: 2,
+                max_vcpus: 2,
+                affinity: Some(vec![
+                    CpuAffinity {
+                        vcpu: 0,
+                        host_cpus: vec![0, 2],
+                    },
+                    CpuAffinity {
+                        vcpu: 1,
+                        host_cpus: vec![1, 3],
+                    }
+                ]),
+                ..Default::default()
+            },
+        );
+
         Ok(())
     }
 
@@ -2898,22 +2951,6 @@ mod tests {
             DiskConfig::parse("path=/path/to_file")?,
             DiskConfig {
                 path: Some(PathBuf::from("/path/to_file")),
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,poll_queue=false")?,
-            DiskConfig {
-                path: Some(PathBuf::from("/path/to_file")),
-                poll_queue: false,
-                ..Default::default()
-            }
-        );
-        assert_eq!(
-            DiskConfig::parse("path=/path/to_file,poll_queue=true")?,
-            DiskConfig {
-                path: Some(PathBuf::from("/path/to_file")),
-                poll_queue: true,
                 ..Default::default()
             }
         );
@@ -3266,13 +3303,15 @@ mod tests {
                 prefault: false,
                 zones: None,
             },
-            kernel: Some(KernelConfig {
-                path: PathBuf::from("/path/to/kernel"),
-            }),
-            initramfs: None,
+            kernel: None,
             cmdline: CmdlineConfig {
-                args: String::from(""),
+                args: String::default(),
             },
+            initramfs: None,
+            payload: Some(PayloadConfig {
+                kernel: Some(PathBuf::from("/path/to/kernel")),
+                ..Default::default()
+            }),
             disks: None,
             net: None,
             rng: RngConfig {
@@ -3301,9 +3340,7 @@ mod tests {
             sgx_epc: None,
             numa: None,
             watchdog: false,
-            #[cfg(feature = "tdx")]
-            tdx: None,
-            #[cfg(feature = "gdb")]
+            #[cfg(feature = "guest_debug")]
             gdb: false,
             platform: None,
         };
@@ -3319,7 +3356,7 @@ mod tests {
         );
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.kernel = None;
+        invalid_config.payload = None;
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::KernelMissing)
@@ -3676,7 +3713,7 @@ mod tests {
             Err(ValidationError::OnIommuSegment(1))
         );
 
-        let mut invalid_config = valid_config;
+        let mut invalid_config = valid_config.clone();
         invalid_config.memory.shared = true;
         invalid_config.platform = Some(PlatformConfig {
             num_pci_segments: 16,
@@ -3691,5 +3728,31 @@ mod tests {
             invalid_config.validate(),
             Err(ValidationError::IommuNotSupportedOnSegment(1))
         );
+
+        let mut still_valid_config = valid_config.clone();
+        still_valid_config.devices = Some(vec![
+            DeviceConfig {
+                path: "/device1".into(),
+                ..Default::default()
+            },
+            DeviceConfig {
+                path: "/device2".into(),
+                ..Default::default()
+            },
+        ]);
+        assert!(still_valid_config.validate().is_ok());
+
+        let mut invalid_config = valid_config;
+        invalid_config.devices = Some(vec![
+            DeviceConfig {
+                path: "/device1".into(),
+                ..Default::default()
+            },
+            DeviceConfig {
+                path: "/device1".into(),
+                ..Default::default()
+            },
+        ]);
+        assert!(invalid_config.validate().is_err());
     }
 }

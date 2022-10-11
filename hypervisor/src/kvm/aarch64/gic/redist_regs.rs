@@ -3,9 +3,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::arch::aarch64::gic::{Error, Result};
-use crate::kvm::kvm_bindings::{kvm_device_attr, KVM_DEV_ARM_VGIC_GRP_REDIST_REGS};
-use crate::{CpuState, Device};
-use std::sync::Arc;
+use crate::device::HypervisorDeviceError;
+use crate::kvm::kvm_bindings::{
+    kvm_device_attr, KVM_DEV_ARM_VGIC_GRP_REDIST_REGS, KVM_REG_ARM64, KVM_REG_ARM64_SYSREG,
+    KVM_REG_ARM64_SYSREG_OP0_MASK, KVM_REG_ARM64_SYSREG_OP0_SHIFT, KVM_REG_ARM64_SYSREG_OP2_MASK,
+    KVM_REG_ARM64_SYSREG_OP2_SHIFT, KVM_REG_SIZE_U64,
+};
+use crate::kvm::Register;
+use crate::kvm::VcpuKvmState;
+use crate::CpuState;
+use kvm_ioctls::DeviceFd;
 
 // Relevant redistributor registers that we want to save/restore.
 const GICR_CTLR: u32 = 0x0000;
@@ -31,6 +38,12 @@ const GICR_ICFGR0: u32 = GICR_SGI_OFFSET + 0x0C00;
 
 const KVM_DEV_ARM_VGIC_V3_MPIDR_SHIFT: u32 = 32;
 const KVM_DEV_ARM_VGIC_V3_MPIDR_MASK: u64 = 0xffffffff << KVM_DEV_ARM_VGIC_V3_MPIDR_SHIFT as u64;
+
+const KVM_ARM64_SYSREG_MPIDR_EL1: u64 = KVM_REG_ARM64 as u64
+    | KVM_REG_SIZE_U64 as u64
+    | KVM_REG_ARM64_SYSREG as u64
+    | (((3_u64) << KVM_REG_ARM64_SYSREG_OP0_SHIFT) & KVM_REG_ARM64_SYSREG_OP0_MASK as u64)
+    | (((5_u64) << KVM_REG_ARM64_SYSREG_OP2_SHIFT) & KVM_REG_ARM64_SYSREG_OP2_MASK as u64);
 
 /// This is how we represent the registers of a distributor.
 /// It is relrvant their offset from the base address of the
@@ -83,31 +96,27 @@ static VGIC_SGI_REGS: &[RdistReg] = &[
     VGIC_RDIST_REG!(GICR_IPRIORITYR0, 32),
 ];
 
-fn redist_attr_access(
-    gic: &Arc<dyn Device>,
-    offset: u32,
-    typer: u64,
-    val: &u32,
-    set: bool,
-) -> Result<()> {
-    let mut gic_dist_attr = kvm_device_attr {
+fn redist_attr_access(gic: &DeviceFd, offset: u32, typer: u64, val: &u32, set: bool) -> Result<()> {
+    let mut gic_redist_attr = kvm_device_attr {
         group: KVM_DEV_ARM_VGIC_GRP_REDIST_REGS,
         attr: (typer & KVM_DEV_ARM_VGIC_V3_MPIDR_MASK) | (offset as u64), // this needs the mpidr
         addr: val as *const u32 as u64,
         flags: 0,
     };
     if set {
-        gic.set_device_attr(&gic_dist_attr)
-            .map_err(Error::SetDeviceAttribute)?;
+        gic.set_device_attr(&gic_redist_attr).map_err(|e| {
+            Error::SetDeviceAttribute(HypervisorDeviceError::SetDeviceAttribute(e.into()))
+        })?;
     } else {
-        gic.get_device_attr(&mut gic_dist_attr)
-            .map_err(Error::GetDeviceAttribute)?;
+        gic.get_device_attr(&mut gic_redist_attr).map_err(|e| {
+            Error::GetDeviceAttribute(HypervisorDeviceError::GetDeviceAttribute(e.into()))
+        })?;
     }
     Ok(())
 }
 
 fn access_redists_aux(
-    gic: &Arc<dyn Device>,
+    gic: &DeviceFd,
     gicr_typer: &[u64],
     state: &mut Vec<u32>,
     reg_list: &[RdistReg],
@@ -137,7 +146,7 @@ fn access_redists_aux(
 }
 
 /// Get redistributor registers.
-pub fn get_redist_regs(gic: &Arc<dyn Device>, gicr_typer: &[u64]) -> Result<Vec<u32>> {
+pub fn get_redist_regs(gic: &DeviceFd, gicr_typer: &[u64]) -> Result<Vec<u32>> {
     let mut state = Vec::new();
     let mut idx: usize = 0;
     access_redists_aux(
@@ -154,7 +163,7 @@ pub fn get_redist_regs(gic: &Arc<dyn Device>, gicr_typer: &[u64]) -> Result<Vec<
 }
 
 /// Set redistributor registers.
-pub fn set_redist_regs(gic: &Arc<dyn Device>, gicr_typer: &[u64], state: &[u32]) -> Result<()> {
+pub fn set_redist_regs(gic: &DeviceFd, gicr_typer: &[u64], state: &[u32]) -> Result<()> {
     let mut idx: usize = 0;
     let mut mut_state = state.to_owned();
     access_redists_aux(
@@ -190,15 +199,16 @@ pub fn construct_gicr_typers(vcpu_states: &[CpuState]) -> Vec<u64> {
      */
     let mut gicr_typers: Vec<u64> = Vec::new();
     for (index, state) in vcpu_states.iter().enumerate() {
-        let last = {
-            if index == vcpu_states.len() - 1 {
-                1
-            } else {
-                0
-            }
-        };
+        let state: VcpuKvmState = state.clone().into();
+        let last = (index == vcpu_states.len() - 1) as u64;
+        // state.sys_regs is a big collection of system registers, including MIPDR_EL1
+        let mpidr: Vec<Register> = state
+            .sys_regs
+            .into_iter()
+            .filter(|reg| reg.id == KVM_ARM64_SYSREG_MPIDR_EL1)
+            .collect();
         //calculate affinity
-        let mut cpu_affid = state.mpidr & 1095233437695;
+        let mut cpu_affid = mpidr[0].addr & 1095233437695;
         cpu_affid = ((cpu_affid & 0xFF00000000) >> 8) | (cpu_affid & 0xFFFFFF);
         gicr_typers.push((cpu_affid << 32) | (1 << 24) | (index as u64) << 8 | (last << 4));
     }

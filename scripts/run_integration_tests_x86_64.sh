@@ -15,7 +15,7 @@ process_common_args "$@"
 features=""
 
 if [ "$hypervisor" = "mshv" ] ;  then
-    features="--no-default-features --features mshv,common"
+    features="--no-default-features --features mshv"
 fi
 
 cp scripts/sha1sums-x86_64 $WORKLOADS_DIR
@@ -166,7 +166,7 @@ VFIO_DIR="$WORKLOADS_DIR/vfio"
 VFIO_DISK_IMAGE="$WORKLOADS_DIR/vfio.img"
 rm -rf $VFIO_DIR $VFIO_DISK_IMAGE
 mkdir -p $VFIO_DIR
-cp $FOCAL_OS_IMAGE $VFIO_DIR
+cp $FOCAL_OS_RAW_IMAGE $VFIO_DIR
 cp $FW $VFIO_DIR
 cp $VMLINUX_IMAGE $VFIO_DIR || exit 1
 
@@ -195,14 +195,14 @@ sudo chmod a+rwX /dev/hugepages
 ulimit -l unlimited
 
 export RUST_BACKTRACE=1
-time cargo test $features "parallel::$test_filter" -- ${test_binary_args[*]}
+time cargo test $features "common_parallel::$test_filter" -- ${test_binary_args[*]}
 RES=$?
 
 # Run some tests in sequence since the result could be affected by other tests
 # running in parallel.
 if [ $RES -eq 0 ]; then
     export RUST_BACKTRACE=1
-    time cargo test $features "sequential::$test_filter" -- --test-threads=1 ${test_binary_args[*]}
+    time cargo test $features "common_sequential::$test_filter" -- --test-threads=1 ${test_binary_args[*]}
     RES=$?
 fi
 

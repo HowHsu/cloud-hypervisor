@@ -8,7 +8,10 @@
 //
 //
 
-use crate::arch::x86::{msr_index, SegmentRegisterOps, MTRR_ENABLE, MTRR_MEM_TYPE_WB};
+use crate::arch::x86::{
+    CpuIdEntry, DescriptorTable, FpuState, LapicState, MsrEntry, SegmentRegister, SpecialRegisters,
+    StandardRegisters, CPUID_FLAG_VALID_INDEX,
+};
 use crate::kvm::{Cap, Kvm, KvmError, KvmResult};
 use serde::{Deserialize, Serialize};
 
@@ -16,100 +19,14 @@ use serde::{Deserialize, Serialize};
 /// Export generically-named wrappers of kvm-bindings for Unix-based platforms
 ///
 pub use {
-    kvm_bindings::kvm_cpuid_entry2 as CpuIdEntry, kvm_bindings::kvm_dtable as DescriptorTable,
-    kvm_bindings::kvm_fpu as FpuState, kvm_bindings::kvm_lapic_state as LapicState,
-    kvm_bindings::kvm_mp_state as MpState, kvm_bindings::kvm_msr_entry as MsrEntry,
-    kvm_bindings::kvm_regs as StandardRegisters, kvm_bindings::kvm_segment as SegmentRegister,
-    kvm_bindings::kvm_sregs as SpecialRegisters, kvm_bindings::kvm_vcpu_events as VcpuEvents,
+    kvm_bindings::kvm_cpuid_entry2, kvm_bindings::kvm_dtable, kvm_bindings::kvm_fpu,
+    kvm_bindings::kvm_lapic_state, kvm_bindings::kvm_mp_state as MpState,
+    kvm_bindings::kvm_msr_entry, kvm_bindings::kvm_regs, kvm_bindings::kvm_segment,
+    kvm_bindings::kvm_sregs, kvm_bindings::kvm_vcpu_events as VcpuEvents,
     kvm_bindings::kvm_xcrs as ExtendedControlRegisters, kvm_bindings::kvm_xsave as Xsave,
     kvm_bindings::CpuId, kvm_bindings::MsrList, kvm_bindings::Msrs as MsrEntries,
-    kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX as CPUID_FLAG_VALID_INDEX,
+    kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
 };
-
-impl SegmentRegisterOps for SegmentRegister {
-    fn segment_type(&self) -> u8 {
-        self.type_
-    }
-    fn set_segment_type(&mut self, val: u8) {
-        self.type_ = val;
-    }
-
-    fn dpl(&self) -> u8 {
-        self.dpl
-    }
-
-    fn set_dpl(&mut self, val: u8) {
-        self.dpl = val;
-    }
-
-    fn present(&self) -> u8 {
-        self.present
-    }
-
-    fn set_present(&mut self, val: u8) {
-        self.present = val;
-    }
-
-    fn long(&self) -> u8 {
-        self.l
-    }
-
-    fn set_long(&mut self, val: u8) {
-        self.l = val;
-    }
-
-    fn avl(&self) -> u8 {
-        self.avl
-    }
-
-    fn set_avl(&mut self, val: u8) {
-        self.avl = val;
-    }
-
-    fn desc_type(&self) -> u8 {
-        self.s
-    }
-
-    fn set_desc_type(&mut self, val: u8) {
-        self.s = val;
-    }
-
-    fn granularity(&self) -> u8 {
-        self.g
-    }
-
-    fn set_granularity(&mut self, val: u8) {
-        self.g = val;
-    }
-
-    fn db(&self) -> u8 {
-        self.db
-    }
-
-    fn set_db(&mut self, val: u8) {
-        self.db = val;
-    }
-}
-
-pub fn boot_msr_entries() -> MsrEntries {
-    MsrEntries::from_entries(&[
-        msr!(msr_index::MSR_IA32_SYSENTER_CS),
-        msr!(msr_index::MSR_IA32_SYSENTER_ESP),
-        msr!(msr_index::MSR_IA32_SYSENTER_EIP),
-        msr!(msr_index::MSR_STAR),
-        msr!(msr_index::MSR_CSTAR),
-        msr!(msr_index::MSR_LSTAR),
-        msr!(msr_index::MSR_KERNEL_GS_BASE),
-        msr!(msr_index::MSR_SYSCALL_MASK),
-        msr!(msr_index::MSR_IA32_TSC),
-        msr_data!(
-            msr_index::MSR_IA32_MISC_ENABLE,
-            msr_index::MSR_IA32_MISC_ENABLE_FAST_STRING as u64
-        ),
-        msr_data!(msr_index::MSR_MTRRdefType, MTRR_ENABLE | MTRR_MEM_TYPE_WB),
-    ])
-    .unwrap()
-}
 
 ///
 /// Check KVM extension for Linux
@@ -137,14 +54,275 @@ pub fn check_required_kvm_extensions(kvm: &Kvm) -> KvmResult<()> {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct VcpuKvmState {
-    pub cpuid: CpuId,
-    pub msrs: MsrEntries,
+    pub cpuid: Vec<CpuIdEntry>,
+    pub msrs: Vec<MsrEntry>,
     pub vcpu_events: VcpuEvents,
-    pub regs: StandardRegisters,
-    pub sregs: SpecialRegisters,
+    pub regs: kvm_regs,
+    pub sregs: kvm_sregs,
     pub fpu: FpuState,
     pub lapic_state: LapicState,
     pub xsave: Xsave,
     pub xcrs: ExtendedControlRegisters,
     pub mp_state: MpState,
+}
+
+impl From<StandardRegisters> for kvm_regs {
+    fn from(regs: StandardRegisters) -> Self {
+        Self {
+            rax: regs.rax,
+            rbx: regs.rbx,
+            rcx: regs.rcx,
+            rdx: regs.rdx,
+            rsi: regs.rsi,
+            rdi: regs.rdi,
+            rsp: regs.rsp,
+            rbp: regs.rbp,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+            r11: regs.r11,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rip: regs.rip,
+            rflags: regs.rflags,
+        }
+    }
+}
+
+impl From<kvm_regs> for StandardRegisters {
+    fn from(regs: kvm_regs) -> Self {
+        Self {
+            rax: regs.rax,
+            rbx: regs.rbx,
+            rcx: regs.rcx,
+            rdx: regs.rdx,
+            rsi: regs.rsi,
+            rdi: regs.rdi,
+            rsp: regs.rsp,
+            rbp: regs.rbp,
+            r8: regs.r8,
+            r9: regs.r9,
+            r10: regs.r10,
+            r11: regs.r11,
+            r12: regs.r12,
+            r13: regs.r13,
+            r14: regs.r14,
+            r15: regs.r15,
+            rip: regs.rip,
+            rflags: regs.rflags,
+        }
+    }
+}
+
+impl From<SegmentRegister> for kvm_segment {
+    fn from(s: SegmentRegister) -> Self {
+        Self {
+            base: s.base,
+            limit: s.limit,
+            selector: s.selector,
+            type_: s.type_,
+            present: s.present,
+            dpl: s.dpl,
+            db: s.db,
+            s: s.s,
+            l: s.l,
+            g: s.g,
+            avl: s.avl,
+            unusable: s.unusable,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<kvm_segment> for SegmentRegister {
+    fn from(s: kvm_segment) -> Self {
+        Self {
+            base: s.base,
+            limit: s.limit,
+            selector: s.selector,
+            type_: s.type_,
+            present: s.present,
+            dpl: s.dpl,
+            db: s.db,
+            s: s.s,
+            l: s.l,
+            g: s.g,
+            avl: s.avl,
+            unusable: s.unusable,
+        }
+    }
+}
+
+impl From<DescriptorTable> for kvm_dtable {
+    fn from(dt: DescriptorTable) -> Self {
+        Self {
+            base: dt.base,
+            limit: dt.limit,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<kvm_dtable> for DescriptorTable {
+    fn from(dt: kvm_dtable) -> Self {
+        Self {
+            base: dt.base,
+            limit: dt.limit,
+        }
+    }
+}
+
+impl From<SpecialRegisters> for kvm_sregs {
+    fn from(s: SpecialRegisters) -> Self {
+        Self {
+            cs: s.cs.into(),
+            ds: s.ds.into(),
+            es: s.es.into(),
+            fs: s.fs.into(),
+            gs: s.gs.into(),
+            ss: s.ss.into(),
+            tr: s.tr.into(),
+            ldt: s.ldt.into(),
+            gdt: s.gdt.into(),
+            idt: s.idt.into(),
+            cr0: s.cr0,
+            cr2: s.cr2,
+            cr3: s.cr3,
+            cr4: s.cr4,
+            cr8: s.cr8,
+            efer: s.efer,
+            apic_base: s.apic_base,
+            interrupt_bitmap: s.interrupt_bitmap,
+        }
+    }
+}
+
+impl From<kvm_sregs> for SpecialRegisters {
+    fn from(s: kvm_sregs) -> Self {
+        Self {
+            cs: s.cs.into(),
+            ds: s.ds.into(),
+            es: s.es.into(),
+            fs: s.fs.into(),
+            gs: s.gs.into(),
+            ss: s.ss.into(),
+            tr: s.tr.into(),
+            ldt: s.ldt.into(),
+            gdt: s.gdt.into(),
+            idt: s.idt.into(),
+            cr0: s.cr0,
+            cr2: s.cr2,
+            cr3: s.cr3,
+            cr4: s.cr4,
+            cr8: s.cr8,
+            efer: s.efer,
+            apic_base: s.apic_base,
+            interrupt_bitmap: s.interrupt_bitmap,
+        }
+    }
+}
+
+impl From<CpuIdEntry> for kvm_cpuid_entry2 {
+    fn from(e: CpuIdEntry) -> Self {
+        let flags = if e.flags & CPUID_FLAG_VALID_INDEX != 0 {
+            KVM_CPUID_FLAG_SIGNIFCANT_INDEX
+        } else {
+            0
+        };
+        Self {
+            function: e.function,
+            index: e.index,
+            flags,
+            eax: e.eax,
+            ebx: e.ebx,
+            ecx: e.ecx,
+            edx: e.edx,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<kvm_cpuid_entry2> for CpuIdEntry {
+    fn from(e: kvm_cpuid_entry2) -> Self {
+        let flags = if e.flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX != 0 {
+            CPUID_FLAG_VALID_INDEX
+        } else {
+            0
+        };
+        Self {
+            function: e.function,
+            index: e.index,
+            flags,
+            eax: e.eax,
+            ebx: e.ebx,
+            ecx: e.ecx,
+            edx: e.edx,
+        }
+    }
+}
+
+impl From<kvm_fpu> for FpuState {
+    fn from(s: kvm_fpu) -> Self {
+        Self {
+            fpr: s.fpr,
+            fcw: s.fcw,
+            fsw: s.fsw,
+            ftwx: s.ftwx,
+            last_opcode: s.last_opcode,
+            last_ip: s.last_ip,
+            last_dp: s.last_dp,
+            xmm: s.xmm,
+            mxcsr: s.mxcsr,
+        }
+    }
+}
+
+impl From<FpuState> for kvm_fpu {
+    fn from(s: FpuState) -> Self {
+        Self {
+            fpr: s.fpr,
+            fcw: s.fcw,
+            fsw: s.fsw,
+            ftwx: s.ftwx,
+            last_opcode: s.last_opcode,
+            last_ip: s.last_ip,
+            last_dp: s.last_dp,
+            xmm: s.xmm,
+            mxcsr: s.mxcsr,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<LapicState> for kvm_lapic_state {
+    fn from(s: LapicState) -> Self {
+        Self { regs: s.regs }
+    }
+}
+
+impl From<kvm_lapic_state> for LapicState {
+    fn from(s: kvm_lapic_state) -> Self {
+        Self { regs: s.regs }
+    }
+}
+
+impl From<kvm_msr_entry> for MsrEntry {
+    fn from(e: kvm_msr_entry) -> Self {
+        Self {
+            index: e.index,
+            data: e.data,
+        }
+    }
+}
+
+impl From<MsrEntry> for kvm_msr_entry {
+    fn from(e: MsrEntry) -> Self {
+        Self {
+            index: e.index,
+            data: e.data,
+            ..Default::default()
+        }
+    }
 }
