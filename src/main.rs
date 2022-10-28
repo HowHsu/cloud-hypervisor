@@ -599,6 +599,7 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
 }
 
 fn main() {
+    println!("[Hao Xu] C-H is starting");
     // Ensure all created files (.e.g sockets) are only accessible by this user
     let _ = unsafe { libc::umask(0o077) };
 

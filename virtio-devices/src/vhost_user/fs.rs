@@ -355,6 +355,7 @@ impl Fs {
             });
         }
 
+        println!("virtiofsd_args: {}", virtiofsd_args);
         if !virtiofsd_args.trim().is_empty() {
             let res = thread::Builder::new()
                 .name("virtiofsd".to_string())

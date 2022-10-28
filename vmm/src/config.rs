@@ -1683,6 +1683,8 @@ impl FsConfig {
 
     pub fn parse(fs: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
+
+        println!("fs_args: {}", fs);
         parser
             .add("tag")
             .add("queue_size")
