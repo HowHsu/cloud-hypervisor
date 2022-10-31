@@ -1561,12 +1561,11 @@ impl Vmm {
             .unwrap()
             .lock()
             .unwrap()
-            .memory
-            .shared
+            .backed_by_shared_memory()
             && send_data_migration.local
         {
             return Err(MigratableError::MigrateSend(anyhow!(
-                "Local migration requires shared memory enabled"
+                "Local migration requires shared memory or hugepages enabled"
             )));
         }
 
