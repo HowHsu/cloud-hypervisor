@@ -452,6 +452,7 @@ fn signal_handler_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_sendto, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
+
     ])
 }
 
@@ -767,13 +768,23 @@ fn get_seccomp_rules(
     thread_type: Thread,
     hypervisor_type: HypervisorType,
 ) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
-    match thread_type {
-        Thread::Api => Ok(api_thread_rules()?),
-        Thread::SignalHandler => Ok(signal_handler_thread_rules()?),
-        Thread::Vcpu => Ok(vcpu_thread_rules(hypervisor_type)?),
-        Thread::Vmm => Ok(vmm_thread_rules(hypervisor_type)?),
-        Thread::PtyForeground => Ok(pty_foreground_thread_rules()?),
-    }
+    let mut rules = match thread_type {
+        Thread::Api => api_thread_rules()?,
+        Thread::SignalHandler => signal_handler_thread_rules()?,
+        Thread::Vcpu => vcpu_thread_rules(hypervisor_type)?,
+        Thread::Vmm => vmm_thread_rules(hypervisor_type)?,
+        Thread::PtyForeground => pty_foreground_thread_rules()?,
+    };
+
+    let mut common_rules = vec![
+                            (libc::SYS_rt_sigaction, vec![]),
+                            (libc::SYS_rt_sigreturn, vec![]),
+                            (libc::SYS_rt_sigprocmask, vec![]),
+                            (libc::SYS_getpid, vec![]),
+                            (libc::SYS_setgroups, vec![]),
+                           ];
+    rules.append(&mut common_rules);
+    Ok(rules)
 }
 
 /// Generate a BPF program based on the seccomp_action value
