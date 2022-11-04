@@ -1042,7 +1042,7 @@ impl Default for DiskConfig {
             vhost_user: false,
             vhost_socket: None,
             id: None,
-            disable_io_uring: false,
+            disable_io_uring: true,
             rate_limiter_config: None,
             pci_segment: 0,
         }
@@ -1114,7 +1114,7 @@ impl DiskConfig {
         let disable_io_uring = parser
             .convert::<Toggle>("_disable_io_uring")
             .map_err(Error::ParseDisk)?
-            .unwrap_or(Toggle(false))
+            .unwrap_or(Toggle(true))
             .0;
         let pci_segment = parser
             .convert("pci_segment")
