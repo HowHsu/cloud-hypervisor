@@ -484,6 +484,9 @@ impl Drop for Fs {
     }
 }
 
+use std::collections::HashMap;
+use std::num::Wrapping;
+
 impl VirtioDevice for Fs {
     fn device_type(&self) -> u32 {
         self.common.device_type
@@ -644,6 +647,10 @@ impl VirtioDevice for Fs {
         }
 
         mappings
+    }
+
+    fn counters(&self) -> Option<HashMap<&'static str, Wrapping<u64>>> {
+        virtiofsd::virtiofsd_ch::virtiofsd_counters()
     }
 }
 
