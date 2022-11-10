@@ -387,6 +387,8 @@ pub struct FsConfig {
     pub pci_segment: u16,
     #[serde(default)]
     pub virtiofsd_args: String,
+    #[serde(default)]
+    pub rate_limiter_config: Option<RateLimiterConfig>,
 }
 
 pub fn default_fsconfig_num_queues() -> usize {
@@ -407,6 +409,7 @@ impl Default for FsConfig {
             id: None,
             pci_segment: 0,
             virtiofsd_args: "".to_string(),
+            rate_limiter_config: None,
         }
     }
 }
