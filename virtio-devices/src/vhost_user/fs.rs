@@ -36,6 +36,8 @@ use vm_migration::{
     Transportable, VersionMapped,
 };
 use vmm_sys_util::eventfd::EventFd;
+use crate::RateLimiterConfig;
+use rate_limiter::RateLimiter;
 
 const NUM_QUEUE_OFFSET: usize = 1;
 const DEFAULT_QUEUE_NUMBER: usize = 2;
@@ -309,6 +311,7 @@ impl Fs {
         req_num_queues: usize,
         queue_size: u16,
         virtiofsd_args: String,
+        rate_limiter_config: Option<RateLimiterConfig>,
         cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
@@ -322,10 +325,15 @@ impl Fs {
 
         let mut virtiofsd_thread = None;
         if !virtiofsd_args.trim().is_empty() {
+            let rate_limiter: Option<RateLimiter> = rate_limiter_config
+            .map(RateLimiterConfig::try_into)
+            .transpose()
+            .map_err(Error::CreateRateLimiter)?;
+
             thread::Builder::new()
                 .name("virtiofsd".to_string())
                 .spawn(move ||
-                       { virtiofsd::virtiofsd_ch::start_virtiofsd(&virtiofsd_args); }
+                       { virtiofsd::virtiofsd_ch::start_virtiofsd(&virtiofsd_args, rate_limiter); }
                 ).map(|thread| virtiofsd_thread = Some(thread))
                 .map_err( |e| {
                     error!("Failed to spawn virtiofsd thread");
