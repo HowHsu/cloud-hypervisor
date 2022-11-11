@@ -2465,6 +2465,7 @@ impl DeviceManager {
                     fs_cfg.num_queues,
                     fs_cfg.queue_size,
                     fs_cfg.virtiofsd_args.clone(),
+                    fs_cfg.rate_limiter_config,
                     None,
                     self.seccomp_action.clone(),
                     self.exit_evt
