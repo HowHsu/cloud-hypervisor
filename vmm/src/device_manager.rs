@@ -2430,6 +2430,7 @@ impl DeviceManager {
                     &fs_cfg.tag,
                     fs_cfg.num_queues,
                     fs_cfg.queue_size,
+                    fs_cfg.virtiofsd_args.clone(),
                     None,
                     self.seccomp_action.clone(),
                     self.restoring,
