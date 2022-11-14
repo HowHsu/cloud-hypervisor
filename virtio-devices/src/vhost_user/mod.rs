@@ -143,6 +143,8 @@ pub enum Error {
     NewMmapRegion(MmapRegionError),
     #[error("Could not find the shm log region")]
     MissingShmLogRegion,
+    #[error("Failed to spawn thread: {0}")]
+    ThreadSpawn(std::io::Error),
 }
 type Result<T> = std::result::Result<T, Error>;
 

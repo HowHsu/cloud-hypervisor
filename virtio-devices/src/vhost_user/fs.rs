@@ -295,6 +295,7 @@ pub struct Fs {
     epoll_thread: Option<thread::JoinHandle<()>>,
     exit_evt: EventFd,
     iommu: bool,
+    virtiofsd_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Fs {
@@ -319,12 +320,17 @@ impl Fs {
         // Calculate the actual number of queues needed.
         let num_queues = NUM_QUEUE_OFFSET + req_num_queues;
 
+        let mut virtiofsd_thread = None;
         if !virtiofsd_args.trim().is_empty() {
-            let res = thread::Builder::new()
+            thread::Builder::new()
                 .name("virtiofsd".to_string())
                 .spawn(move ||
                        { virtiofsd::virtiofsd_ch::start_virtiofsd(&virtiofsd_args); }
-                );
+                ).map(|thread| virtiofsd_thread = Some(thread))
+                .map_err( |e| {
+                    error!("Failed to spawn virtiofsd thread");
+                    Error::ThreadSpawn(e)
+                })?;
         }
         // Connect to the vhost-user socket.
         let mut vu = VhostUserHandle::connect_vhost_user(false, path, num_queues as u64, false)?;
@@ -439,6 +445,7 @@ impl Fs {
             epoll_thread: None,
             exit_evt,
             iommu,
+            virtiofsd_thread,
         })
     }
 
@@ -465,6 +472,7 @@ impl Drop for Fs {
 
 use std::collections::HashMap;
 use std::num::Wrapping;
+use crate::epoll_helper::EpollHelperError;
 
 impl VirtioDevice for Fs {
     fn device_type(&self) -> u32 {
@@ -547,6 +555,10 @@ impl VirtioDevice for Fs {
         let paused = self.common.paused.clone();
         let paused_sync = self.common.paused_sync.clone();
 
+        let mut virtiofsd_thread = None;
+        if !self.virtiofsd_thread.is_none() {
+            virtiofsd_thread = self.virtiofsd_thread.take();
+        }
         let mut epoll_threads = Vec::new();
         spawn_virtio_thread(
             &self.id,
@@ -554,7 +566,13 @@ impl VirtioDevice for Fs {
             Thread::VirtioVhostFs,
             &mut epoll_threads,
             &self.exit_evt,
-            move || handler.run(paused, paused_sync.unwrap()),
+            move || {
+                let ret = handler.run(paused, paused_sync.unwrap());
+                    if let Some(thread) = virtiofsd_thread {
+                        thread.join().map_err(EpollHelperError::ThreadJoin)?;
+                    }
+                ret
+            },
         )?;
         self.epoll_thread = Some(epoll_threads.remove(0));
 
