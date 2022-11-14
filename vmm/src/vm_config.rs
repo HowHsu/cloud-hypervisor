@@ -385,6 +385,8 @@ pub struct FsConfig {
     pub id: Option<String>,
     #[serde(default)]
     pub pci_segment: u16,
+    #[serde(default)]
+    pub virtiofsd_args: String,
 }
 
 pub fn default_fsconfig_num_queues() -> usize {
@@ -404,6 +406,7 @@ impl Default for FsConfig {
             queue_size: default_fsconfig_queue_size(),
             id: None,
             pci_segment: 0,
+            virtiofsd_args: "".to_string(),
         }
     }
 }
