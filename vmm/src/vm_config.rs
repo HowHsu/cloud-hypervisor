@@ -251,7 +251,7 @@ impl Default for DiskConfig {
             vhost_user: false,
             vhost_socket: None,
             id: None,
-            disable_io_uring: false,
+            disable_io_uring: true,
             rate_limiter_config: None,
             pci_segment: 0,
         }

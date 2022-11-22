@@ -891,7 +891,7 @@ impl DiskConfig {
         let disable_io_uring = parser
             .convert::<Toggle>("_disable_io_uring")
             .map_err(Error::ParseDisk)?
-            .unwrap_or(Toggle(false))
+            .unwrap_or(Toggle(true))
             .0;
         let pci_segment = parser
             .convert("pci_segment")
