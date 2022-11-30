@@ -9,8 +9,10 @@ extern crate clap;
 extern crate event_monitor;
 
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
+use clap::crate_version;
 use libc::EFD_NONBLOCK;
 use log::LevelFilter;
+use log::info;
 use option_parser::OptionParser;
 use seccompiler::SeccompAction;
 use signal_hook::consts::SIGSYS;
@@ -415,6 +417,8 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     }))
     .map(|()| log::set_max_level(log_level))
     .map_err(Error::LoggerSetup)?;
+
+    info!("Cube-Hypervisor version {}", crate_version!());
 
     let (api_socket_path, api_socket_fd) =
         if let Some(socket_config) = cmd_arguments.get_one::<String>("api-socket") {
