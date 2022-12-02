@@ -1,9 +1,9 @@
 [package]
-name = "cloud-hypervisor"
+name = "cube-hypervisor"
 version = "0.0.1-7bd6d1fe"
 authors = ["The Cloud Hypervisor Authors"]
 edition = "2021"
-default-run = "cloud-hypervisor"
+default-run = "cube-hypervisor"
 build = "build.rs"
 license = "LICENSE-APACHE & LICENSE-BSD-3-Clause"
 description = "Open source Virtual Machine Monitor (VMM) that runs on top of KVM"
