@@ -221,7 +221,7 @@ pub struct DiskConfig {
     #[serde(default)]
     pub id: Option<String>,
     // For testing use only. Not exposed in API.
-    #[serde(default)]
+    #[serde(default="default_diskconfig_disable_io_uring")]
     pub disable_io_uring: bool,
     #[serde(default)]
     pub pci_segment: u16,
@@ -237,6 +237,10 @@ pub const DEFAULT_DISK_QUEUE_SIZE: u16 = 128;
 
 pub fn default_diskconfig_queue_size() -> u16 {
     DEFAULT_DISK_QUEUE_SIZE
+}
+
+pub fn default_diskconfig_disable_io_uring() -> bool {
+    true
 }
 
 impl Default for DiskConfig {
