@@ -127,7 +127,7 @@ fn prepare_default_values() -> (String, String, String) {
 }
 
 fn create_app(default_vcpus: String, default_memory: String, default_rng: String) -> Command {
-    let app = Command::new("cloud-hypervisor")
+    let app = Command::new("cube-hypervisor")
         // 'BUILT_VERSION' is set by the build script 'build.rs' at
         // compile time
         .version(env!("BUILT_VERSION"))
