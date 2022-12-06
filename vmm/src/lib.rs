@@ -1692,7 +1692,7 @@ impl Vmm {
 
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
         let epoll_fd = self.epoll.as_raw_fd();
-
+        info!("The control_loop is ready");
         'outer: loop {
             let num_events = match epoll::wait(epoll_fd, -1, &mut events[..]) {
                 Ok(res) => res,
