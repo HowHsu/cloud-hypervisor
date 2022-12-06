@@ -301,6 +301,7 @@ fn start_http_thread(
 
             std::panic::catch_unwind(AssertUnwindSafe(move || {
                 server.start_server().unwrap();
+                info!("Http server is up");
                 loop {
                     match server.requests() {
                         Ok(request_vec) => {
