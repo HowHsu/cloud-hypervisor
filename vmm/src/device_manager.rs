@@ -2277,6 +2277,9 @@ impl DeviceManager {
                         .map(|s| s.to_versioned_state(&id))
                         .transpose()
                         .map_err(DeviceManagerError::RestoreGetState)?,
+                    net_cfg.tso,
+                    net_cfg.ufo,
+                    net_cfg.csum,
                 ) {
                     Ok(vun_device) => vun_device,
                     Err(e) => {
@@ -2314,6 +2317,9 @@ impl DeviceManager {
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,
                         state,
+                        net_cfg.tso,
+                        net_cfg.ufo,
+                        net_cfg.csum,
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
@@ -2332,6 +2338,9 @@ impl DeviceManager {
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,
                         state,
+                        net_cfg.tso,
+                        net_cfg.ufo,
+                        net_cfg.csum,
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
@@ -2354,6 +2363,9 @@ impl DeviceManager {
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,
                         state,
+                        net_cfg.tso,
+                        net_cfg.ufo,
+                        net_cfg.csum,
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))

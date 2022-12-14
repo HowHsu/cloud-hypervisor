@@ -77,6 +77,9 @@ impl Net {
         exit_evt: EventFd,
         iommu: bool,
         state: Option<State>,
+        tso: bool,
+        ufo: bool,
+        csum: bool,
     ) -> Result<Net> {
         let mut num_queues = vu_cfg.num_queues;
 
@@ -112,17 +115,7 @@ impl Net {
                 )
             } else {
                 // Filling device and vring features VMM supports.
-                let mut avail_features = 1 << VIRTIO_NET_F_CSUM
-                    | 1 << VIRTIO_NET_F_GUEST_CSUM
-                    | 1 << VIRTIO_NET_F_GUEST_TSO4
-                    | 1 << VIRTIO_NET_F_GUEST_TSO6
-                    | 1 << VIRTIO_NET_F_GUEST_ECN
-                    | 1 << VIRTIO_NET_F_GUEST_UFO
-                    | 1 << VIRTIO_NET_F_HOST_TSO4
-                    | 1 << VIRTIO_NET_F_HOST_TSO6
-                    | 1 << VIRTIO_NET_F_HOST_ECN
-                    | 1 << VIRTIO_NET_F_HOST_UFO
-                    | 1 << VIRTIO_NET_F_MRG_RXBUF
+                let mut avail_features = 1 << VIRTIO_NET_F_MRG_RXBUF
                     | 1 << VIRTIO_NET_F_CTRL_VQ
                     | 1 << VIRTIO_F_RING_EVENT_IDX
                     | 1 << VIRTIO_F_VERSION_1
@@ -130,6 +123,25 @@ impl Net {
 
                 if mtu.is_some() {
                     avail_features |= 1u64 << VIRTIO_NET_F_MTU;
+                }
+
+                if csum {
+                    avail_features |= 1 << VIRTIO_NET_F_CSUM
+                        | 1 << VIRTIO_NET_F_GUEST_CSUM;
+
+                    if tso {
+                        avail_features |= 1 << VIRTIO_NET_F_HOST_ECN
+                            | 1 << VIRTIO_NET_F_HOST_TSO4
+                            | 1 << VIRTIO_NET_F_HOST_TSO6
+                            | 1 << VIRTIO_NET_F_GUEST_ECN
+                            | 1 << VIRTIO_NET_F_GUEST_TSO4
+                            | 1 << VIRTIO_NET_F_GUEST_TSO6;
+                    }
+
+                    if ufo {
+                        avail_features |= 1 << VIRTIO_NET_F_HOST_UFO
+                            | 1 << VIRTIO_NET_F_GUEST_UFO;
+                    }
                 }
 
                 let mut config = VirtioNetConfig::default();

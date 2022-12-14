@@ -1012,7 +1012,8 @@ impl NetConfig {
     num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,\
     vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
     bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
-    ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,pci_segment=<segment_id>\"";
+    ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,pci_segment=<segment_id>\
+    tso=on|off,ufo=on|off,csum=on|off\"";
 
     pub fn parse(net: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1023,6 +1024,9 @@ impl NetConfig {
             .add("mask")
             .add("mac")
             .add("host_mac")
+            .add("tso")
+            .add("ufo")
+            .add("csum")
             .add("mtu")
             .add("iommu")
             .add("queue_size")
@@ -1055,6 +1059,21 @@ impl NetConfig {
             .map_err(Error::ParseNetwork)?
             .unwrap_or_else(default_netconfig_mac);
         let host_mac = parser.convert("host_mac").map_err(Error::ParseNetwork)?;
+        let tso = parser
+            .convert::<Toggle>("tso")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let ufo = parser
+            .convert::<Toggle>("ufo")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let csum = parser
+            .convert::<Toggle>("csum")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(false))
+            .0;
         let mtu = parser.convert("mtu").map_err(Error::ParseNetwork)?;
         let iommu = parser
             .convert::<Toggle>("iommu")
@@ -1156,6 +1175,9 @@ impl NetConfig {
             fds,
             rate_limiter_config,
             pci_segment,
+            tso,
+            ufo,
+            csum,
         };
         Ok(config)
     }
