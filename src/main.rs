@@ -397,9 +397,8 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
 
 fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     let log_level = match cmd_arguments.get_count("v") {
-        0 => LevelFilter::Warn,
-        1 => LevelFilter::Info,
-        2 => LevelFilter::Debug,
+        0 => LevelFilter::Info,
+        1 => LevelFilter::Debug,
         _ => LevelFilter::Trace,
     };
 
