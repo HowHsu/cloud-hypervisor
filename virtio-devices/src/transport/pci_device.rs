@@ -308,9 +308,9 @@ impl VirtioPciDeviceActivator {
         self.device_activated.store(true, Ordering::SeqCst);
 
         if let Some(barrier) = self.barrier.take() {
-            info!("{}: Waiting for barrier", self.id);
+            debug!("{}: Waiting for barrier", self.id);
             barrier.wait();
-            info!("{}: Barrier released", self.id);
+            debug!("{}: Barrier released", self.id);
         }
 
         Ok(())
@@ -1105,12 +1105,12 @@ impl PciDevice for VirtioPciDevice {
             let barrier = Arc::new(Barrier::new(2));
             let activator = self.prepare_activator(Some(barrier.clone()));
             self.pending_activations.lock().unwrap().push(activator);
-            info!(
+            debug!(
                 "{}: Needs activation; writing to activate event fd",
                 self.id
             );
             self.activate_evt.write(1).ok();
-            info!("{}: Needs activation; returning barrier", self.id);
+            debug!("{}: Needs activation; returning barrier", self.id);
             return Some(barrier);
         }
 

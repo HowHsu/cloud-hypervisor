@@ -397,9 +397,9 @@ impl VmOps for VmOpsHandler {
                 info!("Guest MMIO write to unregistered address 0x{:x}", gpa);
             }
             Ok(Some(barrier)) => {
-                info!("Waiting for barrier");
+                debug!("Waiting for barrier");
                 barrier.wait();
-                info!("Barrier released");
+                debug!("Barrier released");
             }
             _ => {}
         };

@@ -1735,7 +1735,7 @@ impl Vmm {
                     EpollDispatch::ActivateVirtioDevices => {
                         if let Some(ref vm) = self.vm {
                             let count = self.activate_evt.read().map_err(Error::EventFdRead)?;
-                            info!(
+                            debug!(
                                 "Trying to activate pending virtio devices: count = {}",
                                 count
                             );
