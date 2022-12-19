@@ -416,7 +416,8 @@ pub fn default_coredump_limit() -> u64 {
 fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     let log_level = match cmd_arguments.get_count("v") {
         0 => LevelFilter::Info,
-        1 => LevelFilter::Debug,
+        1 => LevelFilter::Info,
+        2 => LevelFilter::Debug,
         _ => LevelFilter::Trace,
     };
 
