@@ -9,7 +9,6 @@ extern crate clap;
 extern crate event_monitor;
 
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
-use clap::crate_version;
 use libc::EFD_NONBLOCK;
 use log::LevelFilter;
 use log::info;
@@ -436,7 +435,7 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     .map(|()| log::set_max_level(log_level))
     .map_err(Error::LoggerSetup)?;
 
-    info!("Cube-Hypervisor version {}", crate_version!());
+    info!("Cube-Hypervisor version {}", env!("BUILT_VERSION"));
 
     let mut coredump_limit = default_coredump_limit();
     let mut coredump_filter = default_coredump_filter();
