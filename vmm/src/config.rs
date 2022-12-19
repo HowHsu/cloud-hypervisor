@@ -1291,7 +1291,9 @@ impl BalloonConfig {
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
     \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>\"";
+    queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>,\
+    bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+    ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>\"";
 
     const VIRTIOFSD_ARGS: &'static [&'static str] = &[
     "--shared-dir", "--thread-pool-size", "--xattr", "--posix-acl", "--xattrmap",
