@@ -14,10 +14,12 @@ use libc::EFD_NONBLOCK;
 use log::LevelFilter;
 use log::info;
 use option_parser::OptionParser;
+use rlimit::{setrlimit, Resource};
 use seccompiler::SeccompAction;
 use signal_hook::consts::SIGSYS;
 use std::env;
 use std::fs::File;
+use std::io::Write;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -70,6 +72,8 @@ enum Error {
     LogFileCreation(std::io::Error),
     #[error("Error setting up logger: {0}")]
     LoggerSetup(log::SetLoggerError),
+    #[error("Error setting up coredump: {0}")]
+    CoredumpSetup(std::io::Error),
 }
 
 struct Logger {
@@ -372,6 +376,13 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
                 .help(config::TpmConfig::SYNTAX)
                 .group("vmm-config"),
 
+        )
+        .arg(
+            Arg::new("coredump")
+                .long("coredump")
+                .help("filter=<filter>,limit=<limit>")
+                .num_args(1..)
+                .group("vmm-config"),
         );
 
     #[cfg(target_arch = "x86_64")]
@@ -393,6 +404,14 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
     );
 
     app
+}
+
+pub fn default_coredump_filter() -> String {
+    "0x33".to_string()
+}
+
+pub fn default_coredump_limit() -> u64 {
+    2 * 1024 * 1024 * 1024
 }
 
 fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
@@ -418,6 +437,27 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     .map_err(Error::LoggerSetup)?;
 
     info!("Cube-Hypervisor version {}", crate_version!());
+
+    let mut coredump_limit = default_coredump_limit();
+    let mut coredump_filter = default_coredump_filter();
+    if let Some(coredump_config) = cmd_arguments.get_one::<String>("coredump") {
+        let mut parser = OptionParser::new();
+
+        parser.add("filter").add("limit");
+        parser.parse(coredump_config).unwrap_or_default();
+
+        if let Some(filter) = parser.get("filter") {
+            coredump_filter = filter;
+        }
+
+        if let Some(limit) = parser.get("limit") {
+            coredump_limit = limit.parse::<u64>().unwrap();
+        }
+    }
+
+    let mut filter_file = File::options().write(true).open("/proc/self/coredump_filter").map_err(Error::CoredumpSetup)?;
+    filter_file.write(coredump_filter.as_bytes()).map_err(Error::CoredumpSetup)?;
+    setrlimit(Resource::CORE, coredump_limit, coredump_limit).map_err(Error::CoredumpSetup)?;
 
     let (api_socket_path, api_socket_fd) =
         if let Some(socket_config) = cmd_arguments.get_one::<String>("api-socket") {
