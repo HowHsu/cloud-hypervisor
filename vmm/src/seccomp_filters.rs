@@ -749,6 +749,8 @@ fn vmm_thread_rules(
         (libc::SYS_utimensat, vec![]),
         (libc::SYS_write, vec![]),
         (libc::SYS_writev, vec![]),
+        // rate_limiter related
+        (libc::SYS_timerfd_settime, vec![]),
     ])
 }
 

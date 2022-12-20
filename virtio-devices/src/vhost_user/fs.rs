@@ -36,6 +36,7 @@ use vm_migration::{
     Transportable, VersionMapped,
 };
 use vmm_sys_util::eventfd::EventFd;
+use crate::RateLimiterConfig;
 
 const NUM_QUEUE_OFFSET: usize = 1;
 const DEFAULT_QUEUE_NUMBER: usize = 2;
@@ -309,6 +310,7 @@ impl Fs {
         req_num_queues: usize,
         queue_size: u16,
         virtiofsd_args: String,
+        rate_limiter_config: Option<RateLimiterConfig>,
         cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
@@ -322,10 +324,36 @@ impl Fs {
 
         let mut virtiofsd_thread = None;
         if !virtiofsd_args.trim().is_empty() {
+            let mut ops_size = 0;
+            let mut ops_one_time_burst = 0;
+            let mut ops_refill_time = 0;
+            let mut bw_size = 0;
+            let mut bw_one_time_burst = 0;
+            let mut bw_refill_time = 0;
+
+            if let Some(rlc) = rate_limiter_config {
+                if let Some(rlc_bw) = rlc.bandwidth {
+                    bw_size = rlc_bw.size;
+                    if let Some(rlc_bw_one_time_burst) = rlc_bw.one_time_burst {
+                        bw_one_time_burst = rlc_bw_one_time_burst;
+                    }
+                    bw_refill_time = rlc_bw.refill_time;
+                }
+                if let Some(rlc_ops) = rlc.ops {
+                    ops_size = rlc_ops.size;
+                    if let Some(rlc_ops_one_time_burst) = rlc_ops.one_time_burst {
+                        ops_one_time_burst = rlc_ops_one_time_burst;
+                    }
+                    ops_refill_time = rlc_ops.refill_time;
+                }
+            }
+
             thread::Builder::new()
                 .name("virtiofsd".to_string())
                 .spawn(move ||
-                       { virtiofsd::virtiofsd_ch::start_virtiofsd(&virtiofsd_args); }
+                       { virtiofsd::virtiofsd_ch::start_virtiofsd(&virtiofsd_args,
+                                            ops_size, ops_one_time_burst, ops_refill_time,
+                                            bw_size, bw_one_time_burst, bw_refill_time); }
                 ).map(|thread| virtiofsd_thread = Some(thread))
                 .map_err( |e| {
                     error!("Failed to spawn virtiofsd thread");
