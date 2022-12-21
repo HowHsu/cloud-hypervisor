@@ -96,7 +96,7 @@ impl log::Log for Logger {
         if record.file().is_some() && record.line().is_some() {
             let t = format!(
                 "cube-hypervisor --- {:?} --- <{}> {}:{}:{} -- {}\n",
-                duration,
+                duration.as_millis(),
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
                 record.file().unwrap(),
@@ -107,7 +107,7 @@ impl log::Log for Logger {
         } else {
             let t = format!(
                 "cube-hypervisor --- {:?} --- <{}> {}:{} -- {}\n",
-                duration,
+                duration.as_millis(),
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
                 record.target(),
