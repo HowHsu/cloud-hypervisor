@@ -95,7 +95,7 @@ impl log::Log for Logger {
 
         if record.file().is_some() && record.line().is_some() {
             let t = format!(
-                "cloud-hypervisor: {:?}: <{}> {}:{}:{} -- {}\n",
+                "cube-hypervisor --- {:?} --- <{}> {}:{}:{} -- {}\n",
                 duration,
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
@@ -106,7 +106,7 @@ impl log::Log for Logger {
             (*(self.output.lock().unwrap())).write(t.as_bytes())
         } else {
             let t = format!(
-                "cloud-hypervisor: {:?}: <{}> {}:{} -- {}\n",
+                "cube-hypervisor --- {:?} --- <{}> {}:{} -- {}\n",
                 duration,
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
