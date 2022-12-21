@@ -338,6 +338,7 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
                 .long("log-file")
                 .help("Log file. Standard error is used if not specified")
                 .num_args(1)
+                .default_value("/data/log/CubeVmm/vmm.log")
                 .group("logging"),
         )
         .arg(
@@ -423,6 +424,9 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
 
     let log_file: Box<dyn std::io::Write + Send> =
         if let Some(file) = cmd_arguments.get_one::<String>("log-file") {
+            // create directories.
+            let dir = std::path::Path::new(file).parent().unwrap();
+            std::fs::create_dir_all(dir).map_err(Error::LogFileCreation)?;
             Box::new(
                 std::fs::File::options()
                     .create(true)
