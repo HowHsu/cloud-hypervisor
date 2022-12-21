@@ -94,26 +94,26 @@ impl log::Log for Logger {
         let duration = now.duration_since(self.start);
 
         if record.file().is_some() && record.line().is_some() {
-            writeln!(
-                *(*(self.output.lock().unwrap())),
-                "cloud-hypervisor: {:?}: <{}> {}:{}:{} -- {}",
+            let t = format!(
+                "cloud-hypervisor: {:?}: <{}> {}:{}:{} -- {}\n",
                 duration,
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
                 record.file().unwrap(),
                 record.line().unwrap(),
                 record.args()
-            )
+            );
+            (*(self.output.lock().unwrap())).write(t.as_bytes())
         } else {
-            writeln!(
-                *(*(self.output.lock().unwrap())),
-                "cloud-hypervisor: {:?}: <{}> {}:{} -- {}",
+            let t = format!(
+                "cloud-hypervisor: {:?}: <{}> {}:{} -- {}\n",
                 duration,
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
                 record.target(),
                 record.args()
-            )
+            );
+            (*(self.output.lock().unwrap())).write(t.as_bytes())
         }
         .ok();
     }
