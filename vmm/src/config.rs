@@ -1274,14 +1274,32 @@ impl FsConfig {
     ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>\"";
 
     const VIRTIOFSD_ARGS: &'static [&'static str] = &[
-    "--shared-dir", "--thread-pool-size", "--xattr", "--posix-acl", "--xattrmap",
-    "--seccomp", "--announce-submounts", "--inode-file-handles",
-    "--cache", "--no-readdirplus", "--writeback", "--allow-direct-io", "--print-capabilities",
-    "--modcaps", "--log-level", "--rlimit-nofile", "--compat-options",
-    "--compat-debug", "--no-killpriv-v2", "--killpriv-v2", "--compat-foreground",
-    "--security-label", "--socket-path", "--sandbox", "--syslog",
+        "--shared-dir",
+        "--thread-pool-size",
+        "--xattr",
+        "--posix-acl",
+        "--xattrmap",
+        "--seccomp",
+        "--announce-submounts",
+        "--inode-file-handles",
+        "--cache",
+        "--no-readdirplus",
+        "--writeback",
+        "--allow-direct-io",
+        "--print-capabilities",
+        "--modcaps",
+        "--log-level",
+        "--rlimit-nofile",
+        "--compat-options",
+        "--compat-debug",
+        "--no-killpriv-v2",
+        "--killpriv-v2",
+        "--compat-foreground",
+        "--security-label",
+        "--socket-path",
+        "--sandbox",
+        "--syslog",
     ];
-
 
     fn parser_add_virtiofsd(parser: &mut OptionParser) {
         for option in FsConfig::VIRTIOFSD_ARGS {

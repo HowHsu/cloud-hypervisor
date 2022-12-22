@@ -6,6 +6,7 @@ use super::{Error, Result, DEFAULT_VIRTIO_FEATURES};
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::vhost_user::VhostUserCommon;
+use crate::RateLimiterConfig;
 use crate::{
     ActivateError, ActivateResult, UserspaceMapping, VirtioCommon, VirtioDevice, VirtioDeviceType,
     VirtioInterrupt, VirtioSharedMemoryList, VIRTIO_F_IOMMU_PLATFORM,
@@ -36,7 +37,6 @@ use vm_migration::{
     Transportable, VersionMapped,
 };
 use vmm_sys_util::eventfd::EventFd;
-use crate::RateLimiterConfig;
 
 const NUM_QUEUE_OFFSET: usize = 1;
 const DEFAULT_QUEUE_NUMBER: usize = 2;
@@ -350,12 +350,19 @@ impl Fs {
 
             thread::Builder::new()
                 .name("virtiofsd".to_string())
-                .spawn(move ||
-                       { virtiofsd::virtiofsd_ch::start_virtiofsd(&virtiofsd_args,
-                                            ops_size, ops_one_time_burst, ops_refill_time,
-                                            bw_size, bw_one_time_burst, bw_refill_time); }
-                ).map(|thread| virtiofsd_thread = Some(thread))
-                .map_err( |e| {
+                .spawn(move || {
+                    virtiofsd::virtiofsd_ch::start_virtiofsd(
+                        &virtiofsd_args,
+                        ops_size,
+                        ops_one_time_burst,
+                        ops_refill_time,
+                        bw_size,
+                        bw_one_time_burst,
+                        bw_refill_time,
+                    );
+                })
+                .map(|thread| virtiofsd_thread = Some(thread))
+                .map_err(|e| {
                     error!("Failed to spawn virtiofsd thread");
                     Error::ThreadSpawn(e)
                 })?;
@@ -498,9 +505,9 @@ impl Drop for Fs {
     }
 }
 
+use crate::epoll_helper::EpollHelperError;
 use std::collections::HashMap;
 use std::num::Wrapping;
-use crate::epoll_helper::EpollHelperError;
 
 impl VirtioDevice for Fs {
     fn device_type(&self) -> u32 {
@@ -596,9 +603,9 @@ impl VirtioDevice for Fs {
             &self.exit_evt,
             move || {
                 let ret = handler.run(paused, paused_sync.unwrap());
-                    if let Some(thread) = virtiofsd_thread {
-                        thread.join().map_err(EpollHelperError::ThreadJoin)?;
-                    }
+                if let Some(thread) = virtiofsd_thread {
+                    thread.join().map_err(EpollHelperError::ThreadJoin)?;
+                }
                 ret
             },
         )?;
