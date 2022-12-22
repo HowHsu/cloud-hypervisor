@@ -452,7 +452,6 @@ fn signal_handler_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_sendto, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
-
     ])
 }
 
@@ -913,12 +912,12 @@ fn get_seccomp_rules(
     };
 
     let mut common_rules = vec![
-                            (libc::SYS_rt_sigaction, vec![]),
-                            (libc::SYS_rt_sigreturn, vec![]),
-                            (libc::SYS_rt_sigprocmask, vec![]),
-                            (libc::SYS_getpid, vec![]),
-                            (libc::SYS_setgroups, vec![]),
-                           ];
+        (libc::SYS_rt_sigaction, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_rt_sigprocmask, vec![]),
+        (libc::SYS_getpid, vec![]),
+        (libc::SYS_setgroups, vec![]),
+    ];
     rules.append(&mut common_rules);
     Ok(rules)
 }
