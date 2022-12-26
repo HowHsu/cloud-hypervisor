@@ -18,6 +18,9 @@ codegen-units = 1
 opt-level = "s"
 panic = 'abort'
 
+[profile.dev]
+panic = 'abort'
+
 [dependencies]
 anyhow = "1.0.66"
 api_client = { path = "api_client" }
