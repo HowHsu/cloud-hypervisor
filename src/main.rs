@@ -421,13 +421,18 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
         _ => LevelFilter::Trace,
     };
 
-    let log_file: Box<dyn std::io::Write + Send> = if let Some(file) =
-        cmd_arguments.get_one::<String>("log-file")
-    {
-        Box::new(std::fs::File::create(std::path::Path::new(file)).map_err(Error::LogFileCreation)?)
-    } else {
-        Box::new(std::io::stderr())
-    };
+    let log_file: Box<dyn std::io::Write + Send> =
+        if let Some(file) = cmd_arguments.get_one::<String>("log-file") {
+            Box::new(
+                std::fs::File::options()
+                    .create(true)
+                    .append(true)
+                    .open(std::path::Path::new(file))
+                    .map_err(Error::LogFileCreation)?,
+            )
+        } else {
+            Box::new(std::io::stderr())
+        };
 
     log::set_boxed_logger(Box::new(Logger {
         output: Mutex::new(log_file),
