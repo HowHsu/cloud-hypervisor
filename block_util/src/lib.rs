@@ -28,6 +28,7 @@ use std::convert::TryInto;
 use std::fs::File;
 use std::io::{self, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::os::linux::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::result;
 use std::sync::Arc;
@@ -695,7 +696,19 @@ pub fn detect_image_type(f: &mut File) -> std::io::Result<ImageType> {
     }
     let mut s = Sector { data: [0; 512] };
 
-    f.read_exact(&mut s.data)?;
+    match f.read_exact(&mut s.data) {
+        Ok(_) => {}
+        Err(e) => {
+            let proc = String::from(format!("/proc/self/fd/{}", f.as_raw_fd()));
+            let path = Path::new(&proc);
+            info!(
+                "image file {} length {}",
+                path.read_link()?.to_str().unwrap(),
+                f.metadata().unwrap().len()
+            );
+            return Err(e);
+        }
+    }
 
     // Check 4 first bytes to get the header value and determine the image type
     let image_type = if u32::from_be_bytes(s.data[0..4].try_into().unwrap()) == QCOW_MAGIC {
