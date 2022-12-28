@@ -10,8 +10,8 @@ extern crate event_monitor;
 
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use libc::EFD_NONBLOCK;
-use log::LevelFilter;
 use log::info;
+use log::LevelFilter;
 use option_parser::OptionParser;
 use rlimit::{setrlimit, Resource};
 use seccompiler::SeccompAction;
@@ -455,8 +455,13 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
         }
     }
 
-    let mut filter_file = File::options().write(true).open("/proc/self/coredump_filter").map_err(Error::CoredumpSetup)?;
-    filter_file.write(coredump_filter.as_bytes()).map_err(Error::CoredumpSetup)?;
+    let mut filter_file = File::options()
+        .write(true)
+        .open("/proc/self/coredump_filter")
+        .map_err(Error::CoredumpSetup)?;
+    filter_file
+        .write(coredump_filter.as_bytes())
+        .map_err(Error::CoredumpSetup)?;
     setrlimit(Resource::CORE, coredump_limit, coredump_limit).map_err(Error::CoredumpSetup)?;
 
     let (api_socket_path, api_socket_fd) =
