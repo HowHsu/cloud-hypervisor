@@ -78,6 +78,7 @@ enum Error {
 struct Logger {
     output: Mutex<Box<dyn std::io::Write + Send>>,
     start: std::time::Instant,
+    sandboxid: Box<String>,
 }
 
 impl log::Log for Logger {
@@ -95,7 +96,8 @@ impl log::Log for Logger {
 
         if record.file().is_some() && record.line().is_some() {
             let t = format!(
-                "cube-hypervisor --- {:?} --- <{}> {}:{}:{} -- {}\n",
+                "{} --- {:?} --- <{}> {}:{}:{} -- {}\n",
+                self.sandboxid,
                 duration.as_millis(),
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
@@ -106,7 +108,8 @@ impl log::Log for Logger {
             (*(self.output.lock().unwrap())).write(t.as_bytes())
         } else {
             let t = format!(
-                "cube-hypervisor --- {:?} --- <{}> {}:{} -- {}\n",
+                "{} --- {:?} --- <{}> {}:{} -- {}\n",
+                self.sandboxid,
                 duration.as_millis(),
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
@@ -342,6 +345,13 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
                 .group("logging"),
         )
         .arg(
+            Arg::new("sandbox-id")
+                .long("sandbox-id")
+                .help("Ssandbox ID, will show in logs")
+                .num_args(1)
+                .group("logging"),
+        )
+        .arg(
             Arg::new("api-socket")
                 .long("api-socket")
                 .help("HTTP API socket (UNIX domain socket): path=</path/to/a/file> or fd=<fd>.")
@@ -438,9 +448,17 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
             Box::new(std::io::stderr())
         };
 
+    let sandbox_id: Box<String> =
+        if let Some(sandboxid) = cmd_arguments.get_one::<String>("sandbox-id") {
+            Box::new(sandboxid.to_string())
+        } else {
+            Box::new(String::from("cube-hypervisor"))
+        };
+
     log::set_boxed_logger(Box::new(Logger {
         output: Mutex::new(log_file),
         start: std::time::Instant::now(),
+        sandboxid: sandbox_id,
     }))
     .map(|()| log::set_max_level(log_level))
     .map_err(Error::LoggerSetup)?;
