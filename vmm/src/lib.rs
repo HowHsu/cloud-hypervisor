@@ -389,10 +389,12 @@ pub struct Vmm {
     activate_evt: EventFd,
     signals: Option<Handle>,
     threads: Vec<thread::JoinHandle<()>>,
+    pinglog: u32,
 }
 
 impl Vmm {
     pub const HANDLED_SIGNALS: [i32; 2] = [SIGTERM, SIGINT];
+    pub const DEFAULT_PING_LOG_COUNT: u32 = 3;
 
     fn signal_handler(mut signals: Signals, on_tty: bool, exit_evt: &EventFd) {
         for sig in &Self::HANDLED_SIGNALS {
@@ -513,6 +515,7 @@ impl Vmm {
             activate_evt,
             signals: None,
             threads: vec![],
+            pinglog: Self::DEFAULT_PING_LOG_COUNT,
         })
     }
 
@@ -1749,7 +1752,18 @@ impl Vmm {
                             // Read from the API receiver channel
                             let api_request = api_receiver.recv().map_err(Error::ApiRequestRecv)?;
 
-                            info!("API request event: {:?}", api_request);
+                            match api_request {
+                                ApiRequest::VmmPing(..) => {
+                                    if self.pinglog != 0 {
+                                        self.pinglog = self.pinglog - 1;
+                                        info!("API request event: {:?}", api_request);
+                                    }
+                                }
+                                _ => {
+                                    info!("API request event: {:?}", api_request);
+                                }
+                            }
+
                             match api_request {
                                 ApiRequest::VmCreate(config, sender) => {
                                     let response = self
