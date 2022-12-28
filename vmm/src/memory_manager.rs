@@ -1610,7 +1610,7 @@ impl MemoryManager {
             }
         }
 
-        info!(
+        debug!(
             "Created userspace mapping: {:x} -> {:x} {:x}",
             guest_phys_addr, userspace_addr, memory_size
         );

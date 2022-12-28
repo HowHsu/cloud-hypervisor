@@ -2071,7 +2071,7 @@ impl DeviceManager {
             id
         };
 
-        info!("Creating virtio-block device: {:?}", disk_cfg);
+        info!("Creating virtio-block device: id = {}", id);
 
         let snapshot = snapshot_from_id(self.snapshot.as_ref(), id.as_str());
 
@@ -2246,7 +2246,7 @@ impl DeviceManager {
             net_cfg.id = Some(id.clone());
             id
         };
-        info!("Creating virtio-net device: {:?}", net_cfg);
+        info!("Creating virtio-net device: id = {}", id);
 
         let snapshot = snapshot_from_id(self.snapshot.as_ref(), id.as_str());
 
@@ -2414,7 +2414,7 @@ impl DeviceManager {
         // Add virtio-rng if required
         let rng_config = self.config.lock().unwrap().rng.clone();
         if let Some(rng_path) = rng_config.src.to_str() {
-            info!("Creating virtio-rng device: {:?}", rng_config);
+            info!("Creating virtio-rng device");
             let id = String::from(RNG_DEVICE_NAME);
 
             let virtio_rng_device = Arc::new(Mutex::new(
@@ -2464,7 +2464,7 @@ impl DeviceManager {
             id
         };
 
-        info!("Creating virtio-fs device: {:?}", fs_cfg);
+        info!("Creating virtio-fs device: id = {}", id);
 
         let mut node = device_node!(id);
 
@@ -2533,7 +2533,7 @@ impl DeviceManager {
             id
         };
 
-        info!("Creating virtio-pmem device: {:?}", pmem_cfg);
+        info!("Creating virtio-pmem device: id = {}", id);
 
         let mut node = device_node!(id);
 
@@ -2719,7 +2719,7 @@ impl DeviceManager {
             id
         };
 
-        info!("Creating virtio-vsock device: {:?}", vsock_cfg);
+        info!("Creating virtio-vsock device: id = {}", id);
 
         let socket_path = vsock_cfg
             .socket
@@ -2930,7 +2930,7 @@ impl DeviceManager {
             id
         };
 
-        info!("Creating vDPA device: {:?}", vdpa_cfg);
+        info!("Creating vDPA device: id = {}", id);
 
         let device_path = vdpa_cfg
             .path

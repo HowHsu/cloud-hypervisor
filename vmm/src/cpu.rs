@@ -341,7 +341,7 @@ impl Vcpu {
             self.mpidr = arch::configure_vcpu(&self.vcpu, self.id, kernel_entry_point)
                 .map_err(Error::VcpuConfiguration)?;
         }
-        info!("Configuring vCPU: cpu_id = {}", self.id);
+        debug!("Configuring vCPU: cpu_id = {}", self.id);
         #[cfg(target_arch = "x86_64")]
         arch::configure_vcpu(
             &self.vcpu,
@@ -755,7 +755,7 @@ impl CpuManager {
         entry_point: Option<EntryPoint>,
         snapshot: Option<Snapshot>,
     ) -> Result<()> {
-        info!("Creating vCPU: cpu_id = {}", cpu_id);
+        debug!("Creating vCPU: cpu_id = {}", cpu_id);
 
         let mut vcpu = Vcpu::new(cpu_id, &self.vm, Some(self.vm_ops.clone()))?;
 

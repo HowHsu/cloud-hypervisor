@@ -420,7 +420,7 @@ impl VmOps for VmOpsHandler {
         }
 
         if let Err(vm_device::BusError::MissingAddressRange) = self.io_bus.read(port, data) {
-            info!("Guest PIO read to unregistered address 0x{:x}", port);
+            debug!("Guest PIO read to unregistered address 0x{:x}", port);
         }
         Ok(())
     }
@@ -440,7 +440,7 @@ impl VmOps for VmOpsHandler {
 
         match self.io_bus.write(port, data) {
             Err(vm_device::BusError::MissingAddressRange) => {
-                info!("Guest PIO write to unregistered address 0x{:x}", port);
+                debug!("Guest PIO write to unregistered address 0x{:x}", port);
             }
             Ok(Some(barrier)) => {
                 info!("Waiting for barrier");
@@ -516,7 +516,7 @@ impl Vm {
             None
         };
 
-        info!("Booting VM from config: {:?}", &config);
+        info!("Booting VM");
 
         // Create NUMA nodes based on NumaConfig.
         let numa_nodes =
@@ -1069,7 +1069,7 @@ impl Vm {
     #[cfg(target_arch = "x86_64")]
     fn configure_system(&mut self, rsdp_addr: GuestAddress) -> Result<()> {
         trace_scoped!("configure_system");
-        info!("Configuring system");
+        debug!("Configuring system");
         let mem = self.memory_manager.lock().unwrap().boot_guest_memory();
 
         let initramfs_config = match self.initramfs {
