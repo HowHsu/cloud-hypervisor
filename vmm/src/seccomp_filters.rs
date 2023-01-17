@@ -887,6 +887,7 @@ fn api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_futex, vec![]),
         (libc::SYS_getrandom, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
         (libc::SYS_ioctl, create_api_ioctl_seccomp_rule()?),
         (libc::SYS_madvise, vec![]),
         (libc::SYS_mmap, vec![]),
