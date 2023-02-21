@@ -234,7 +234,6 @@ pub struct Fs {
     config: VirtioFsConfig,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
-    iommu: bool,
     backendfs_config: BackendFsConfig,
 }
 
@@ -280,6 +279,9 @@ impl Fs {
                 | 1 << VIRTIO_F_IN_ORDER
                 | 1 << VIRTIO_F_ORDER_PLATFORM
                 | 1 << VIRTIO_F_NOTIFICATION_DATA;
+            if iommu {
+                avail_features |= 1 << VIRTIO_F_IOMMU_PLATFORM;
+            }
 
             // Create virtio-fs device configuration.
             let mut config = VirtioFsConfig::default();
@@ -304,7 +306,6 @@ impl Fs {
             config,
             seccomp_action,
             exit_evt,
-            iommu,
             backendfs_config: backendfs_config.clone(),
         })
     }
@@ -410,11 +411,7 @@ impl VirtioDevice for Fs {
     }
 
     fn features(&self) -> u64 {
-        let mut features = self.common.avail_features;
-        if self.iommu {
-            features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
-        }
-        features
+        self.common.avail_features
     }
 
     fn ack_features(&mut self, value: u64) {
