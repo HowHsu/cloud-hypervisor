@@ -10,13 +10,17 @@ use super::{
     MacAddr,
 };
 use crate::mac::MAC_ADDR_LEN;
+use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs::File;
 use std::io::{Error as IoError, Read, Result as IoResult, Write};
 use std::net;
 use std::os::raw::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use thiserror::Error;
 use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val};
+use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -36,6 +40,20 @@ pub enum Error {
     InvalidIfname,
     #[error("Error parsing MAC data: {0}")]
     MacParsing(IoError),
+    #[error("Failed to connect to tap pool: {0}")]
+    OpenTunConnect(IoError),
+    #[error("Failed to sendmsg to tap pool: {0}")]
+    OpenTunJson(serde_json::Error),
+    #[error("Failed to sendmsg to tap pool: {0}")]
+    OpenTunSendmsg(IoError),
+    #[error("Failed to recvmsg from tap pool: {0}")]
+    OpenTunRecvmsg(vmm_sys_util::errno::Error),
+    #[error("Couldn't got FD from tap pool")]
+    OpenTunNoFD,
+    #[error("Couldn't dup FD from tap pool")]
+    OpenTunDupErr(IoError),
+    #[error("Couldn't set FD flags ")]
+    OpenTunSetflErr(IoError),
 }
 
 pub type Result<T> = ::std::result::Result<T, Error>;
@@ -50,6 +68,7 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 pub struct Tap {
     tap_file: File,
     if_name: Vec<u8>,
+    donated: bool,
 }
 
 impl PartialEq for Tap {
@@ -63,6 +82,7 @@ impl std::clone::Clone for Tap {
         Tap {
             tap_file: self.tap_file.try_clone().unwrap(),
             if_name: self.if_name.clone(),
+            donated: self.donated,
         }
     }
 }
@@ -86,7 +106,94 @@ fn build_terminated_if_name(if_name: &str) -> Result<Vec<u8>> {
     Ok(terminated_if_name)
 }
 
+#[allow(non_snake_case)]
+#[derive(Default, Deserialize, Serialize)]
+struct TapRequest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    sandboxId: String,
+}
+
+fn request_file_from_pool<T: Read + Write + ScmSocket>(
+    sock: &mut T,
+    if_name: &str,
+    sandbox_id: String,
+) -> Result<File> {
+    let buf = &mut vec![0; 256];
+    let request = TapRequest {
+        name: if_name.to_string(),
+        sandboxId: sandbox_id,
+    };
+
+    // Send message
+    let body = serde_json::to_vec(&request).map_err(Error::OpenTunJson)?;
+    sock.write_all(&body).map_err(Error::OpenTunSendmsg)?;
+
+    let mut fds = [0; 1];
+    let mut iovecs = [libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    }];
+
+    let (_, fd_count) = unsafe {
+        sock.recv_with_fds(&mut iovecs, &mut fds)
+            .map_err(Error::OpenTunRecvmsg)?
+    };
+
+    if fd_count == 0 {
+        return Err(Error::OpenTunNoFD);
+    }
+
+    // Dup FD.
+    let fd = unsafe { libc::dup(fds[0]) };
+    if fd < 0 {
+        return Err(Error::OpenTunDupErr(IoError::last_os_error()));
+    }
+
+    // Set nonblock.
+    let ret = unsafe {
+        let mut flags = libc::fcntl(fd, libc::F_GETFL);
+        flags |= libc::O_NONBLOCK;
+        libc::fcntl(fd, libc::F_SETFL, flags)
+    };
+    if ret < 0 {
+        unsafe { libc::close(fd) };
+        return Err(Error::OpenTunSetflErr(IoError::last_os_error()));
+    }
+
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn request_from_pool(if_name: &str, sandbox_id: String) -> Result<File> {
+    let path = match env::var("CUBE_TAP_SERV_PATH") {
+        Ok(var) => var,
+        Err(_) => "/run/containerd/cubetap.sock".to_string(),
+    };
+
+    let mut sock = UnixStream::connect(path).map_err(Error::OpenTunConnect)?;
+
+    request_file_from_pool(&mut sock, if_name, sandbox_id)
+}
+
 impl Tap {
+    // Fast path to open TAP. Open and Initialize Tap device always
+    // needs some netlink related operation, which will invoke
+    // rtnl_lock contention.
+    // Here we introduce a new way to avoid such costs. Create Tap
+    // pool, open and initialize Tap devices before launch VM. When
+    // we launch new VM, try to got Tap device FD from the Tap pool,
+    // then we could directly use the FD.
+    pub fn lookup_from_pool(if_name: &str, sandbox_id: String) -> Result<Tap> {
+        let file = request_from_pool(if_name, sandbox_id)?;
+
+        return Ok(Tap {
+            tap_file: file,
+            if_name: if_name.into(),
+            donated: true,
+        });
+    }
+
     pub fn open_named(if_name: &str, num_queue_pairs: usize, flags: Option<i32>) -> Result<Tap> {
         let terminated_if_name = build_terminated_if_name(if_name)?;
 
@@ -147,6 +254,7 @@ impl Tap {
         Ok(Tap {
             tap_file: tuntap,
             if_name,
+            donated: false,
         })
     }
 
@@ -192,7 +300,11 @@ impl Tap {
             return Err(Error::ConfigureTap(IoError::last_os_error()));
         }
 
-        let tap = Tap { tap_file, if_name };
+        let tap = Tap {
+            tap_file,
+            if_name,
+            donated: false,
+        };
         let vnet_hdr_size = vnet_hdr_len() as i32;
         tap.set_vnet_hdr_size(vnet_hdr_size)?;
 
@@ -399,6 +511,10 @@ impl Tap {
 
     pub fn get_if_name(&self) -> Vec<u8> {
         self.if_name.clone()
+    }
+
+    pub fn is_donated(&self) -> bool {
+        return self.donated;
     }
 }
 

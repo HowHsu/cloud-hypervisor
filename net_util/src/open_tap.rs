@@ -68,10 +68,28 @@ pub fn open_tap(
     mtu: Option<u16>,
     num_rx_q: usize,
     flags: Option<i32>,
+    sandbox_id: Option<String>,
 ) -> Result<Vec<Tap>> {
     let mut taps: Vec<Tap> = Vec::new();
     let mut ifname: String = String::new();
     let vnet_hdr_size = vnet_hdr_len() as i32;
+
+    if num_rx_q == 1 {
+        if let Some(name) = if_name {
+            if let Some(sandbox_id) = sandbox_id {
+                match Tap::lookup_from_pool(name, sandbox_id) {
+                    Ok(tap) => {
+                        taps.push(tap);
+                        info!("Fast request tap success");
+                        return Ok(taps);
+                    }
+                    Err(e) => {
+                        info!("Fast request tap failed {:?}, fall back to slow path", e)
+                    }
+                }
+            }
+        }
+    }
 
     // In case the tap interface already exists, check if the number of
     // queues is appropriate. The tap might not support multiqueue while
