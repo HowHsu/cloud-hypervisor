@@ -2520,6 +2520,7 @@ impl DeviceManager {
                 versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
                     .map_err(DeviceManagerError::RestoreGetState)?,
                 bfs_cfg,
+                None,
             )
             .map_err(DeviceManagerError::CreateNativeVirtioFs)?,
         ));
