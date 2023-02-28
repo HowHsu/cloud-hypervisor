@@ -756,6 +756,7 @@ impl Vm {
             tdx_enabled,
             None,
             None,
+            None,
             #[cfg(target_arch = "x86_64")]
             sgx_epc_config,
         )

@@ -834,6 +834,22 @@ impl MemoryConfig {
 
         size
     }
+
+    pub fn exist_shared(&self) -> bool {
+        if self.shared {
+            return true;
+        }
+
+        if let Some(zones) = &self.zones {
+            for zone in zones.iter() {
+                if zone.shared {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
 }
 
 impl DiskConfig {
