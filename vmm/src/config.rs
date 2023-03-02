@@ -37,6 +37,10 @@ pub enum Error {
     ParseVsockCidMissing,
     /// Missing restore source_url parameter.
     ParseRestoreSourceUrlMissing,
+    /// Missing restore device id parameter.
+    ParseRestoreDeviceIdMissing,
+    /// Missing restore device path parameter.
+    ParseRestoreDevicePathMissing,
     /// Error parsing CPU options
     ParseCpus(OptionParserError),
     /// Invalid CPU features
@@ -71,6 +75,8 @@ pub enum Error {
     ParseVsock(OptionParserError),
     /// Failed parsing restore parameters
     ParseRestore(OptionParserError),
+    /// Failed parsing restore device parameters
+    ParseRestoreDevice(OptionParserError),
     /// Failed parsing SGX EPC parameters
     #[cfg(target_arch = "x86_64")]
     ParseSgxEpc(OptionParserError),
@@ -324,6 +330,7 @@ impl fmt::Display for Error {
             ParseRng(o) => write!(f, "Error parsing --rng: {}", o),
             ParseBalloon(o) => write!(f, "Error parsing --balloon: {}", o),
             ParseRestore(o) => write!(f, "Error parsing --restore: {}", o),
+            ParseRestoreDevice(o) => write!(f, "Error parsing --restore-device: {}", o),
             #[cfg(target_arch = "x86_64")]
             ParseSgxEpc(o) => write!(f, "Error parsing --sgx-epc: {}", o),
             #[cfg(target_arch = "x86_64")]
@@ -331,6 +338,12 @@ impl fmt::Display for Error {
             ParseNuma(o) => write!(f, "Error parsing --numa: {}", o),
             ParseRestoreSourceUrlMissing => {
                 write!(f, "Error parsing --restore: source_url missing")
+            }
+            ParseRestoreDeviceIdMissing => {
+                write!(f, "Error parsing --restore-device: id missing")
+            }
+            ParseRestoreDevicePathMissing => {
+                write!(f, "Error parsing --restore-device: path missing")
             }
             ParseUserDeviceSocketMissing => {
                 write!(f, "Error parsing --user-device: socket missing")
@@ -1982,11 +1995,21 @@ impl NumaConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RestoreDevice {
+    pub id: String,
+    pub path: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct RestoreConfig {
     pub source_url: PathBuf,
     #[serde(default)]
     pub prefault: bool,
+    pub disks: Option<Vec<DiskConfig>>,
+    pub net: Option<Vec<NetConfig>>,
+    pub fs: Option<Vec<FsConfig>>,
+    pub vsock: Option<VsockConfig>,
 }
 
 impl RestoreConfig {
@@ -2012,6 +2035,10 @@ impl RestoreConfig {
         Ok(RestoreConfig {
             source_url,
             prefault,
+            disks: None,
+            net: None,
+            fs: None,
+            vsock: None,
         })
     }
 }
@@ -2063,6 +2090,97 @@ impl VmConfig {
             true
         } else {
             false
+        }
+    }
+
+    pub fn update_disks(&mut self, disk_cfgs: &Vec<DiskConfig>) {
+        if let Some(disks) = &mut self.disks {
+            let mut devices: HashMap<String, PathBuf> = HashMap::default();
+            for disk_cfg in disk_cfgs.iter() {
+                if disk_cfg.id.is_none() {
+                    continue;
+                }
+                if disk_cfg.path.is_none() {
+                    continue;
+                }
+                devices.insert(
+                    disk_cfg.id.as_ref().unwrap().clone(),
+                    disk_cfg.path.as_ref().unwrap().clone(),
+                );
+            }
+
+            for disk in disks.iter_mut() {
+                if let Some(id) = &disk.id {
+                    if let Some(path) = devices.get(&id.clone()) {
+                        disk.path = Some(PathBuf::from(path));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn update_nets(&mut self, net_cfgs: &Vec<NetConfig>) {
+        if let Some(nets) = &mut self.net {
+            let mut devices: HashMap<String, String> = HashMap::default();
+            for net_cfg in net_cfgs.iter() {
+                if net_cfg.id.is_none() {
+                    continue;
+                }
+                if net_cfg.tap.is_none() {
+                    continue;
+                }
+                devices.insert(
+                    net_cfg.id.as_ref().unwrap().clone(),
+                    net_cfg.tap.as_ref().unwrap().clone(),
+                );
+            }
+
+            for net in nets.iter_mut() {
+                if let Some(id) = &net.id {
+                    if let Some(tap) = devices.get(&id.clone()) {
+                        net.tap = Some(tap.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn update_fses(&mut self, fs_cfgs: &Vec<FsConfig>) {
+        if let Some(fses) = &mut self.fs {
+            let mut devices: HashMap<String, String> = HashMap::default();
+            for fs_cfg in fs_cfgs.iter() {
+                if fs_cfg.id.is_none() {
+                    continue;
+                }
+                if let Some(backend) = &fs_cfg.backendfs_config {
+                    devices.insert(
+                        fs_cfg.id.as_ref().unwrap().clone(),
+                        backend.shared_dir.clone(),
+                    );
+                }
+            }
+
+            for fs in fses.iter_mut() {
+                if let Some(id) = &fs.id {
+                    if let Some(backend) = &mut fs.backendfs_config {
+                        if let Some(dir) = devices.get(&id.clone()) {
+                            backend.shared_dir = dir.clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn update_vsock(&mut self, vsock_cfg: &VsockConfig) {
+        if let Some(vsock) = &mut self.vsock {
+            if vsock.id.is_none() {
+                return;
+            }
+            if vsock_cfg.id.is_none() {
+                return;
+            }
+            vsock.socket = vsock_cfg.socket.clone();
         }
     }
 

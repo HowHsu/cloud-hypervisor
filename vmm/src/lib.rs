@@ -629,10 +629,26 @@ impl Vmm {
         }
         // Safe to unwrap as we checked it was Some(&str).
         let source_url = source_url.unwrap();
+        let vm_config = Arc::new(Mutex::new({
+            let mut vm_config = recv_vm_config(source_url).map_err(VmError::Restore)?;
+            if let Some(disks) = &restore_cfg.disks {
+                vm_config.update_disks(disks);
+            }
+            if let Some(nets) = &restore_cfg.net {
+                vm_config.update_nets(nets);
+            }
+            if let Some(vsock) = &restore_cfg.vsock {
+                vm_config.update_vsock(vsock);
+            }
+            if let Some(fses) = &restore_cfg.fs {
+                vm_config.update_fses(fses);
+            }
 
-        let vm_config = Arc::new(Mutex::new(
-            recv_vm_config(source_url).map_err(VmError::Restore)?,
-        ));
+            vm_config
+        }));
+
+        info!("config {:?}", vm_config);
+
         let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::Restore)?;
