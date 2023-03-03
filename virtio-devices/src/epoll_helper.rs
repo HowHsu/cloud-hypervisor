@@ -37,8 +37,6 @@ pub enum EpollHelperError {
     HandleEvent(anyhow::Error),
     #[error("Failed to handle timeout: {0}")]
     HandleTimeout(anyhow::Error),
-    #[error("Failed to join on virtiofsd thread: {0:?}")]
-    ThreadJoin(std::boxed::Box<dyn std::any::Any + std::marker::Send>),
 }
 
 pub const EPOLL_HELPER_EVENT_PAUSE: u16 = 0;
