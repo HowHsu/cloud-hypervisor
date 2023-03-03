@@ -145,8 +145,6 @@ pub enum Error {
     MissingShmLogRegion,
     #[error("Failed to spawn thread: {0}")]
     ThreadSpawn(std::io::Error),
-    #[error("Failed to create rate limiter: {0}")]
-    CreateRateLimiter(std::io::Error),
 }
 type Result<T> = std::result::Result<T, Error>;
 
