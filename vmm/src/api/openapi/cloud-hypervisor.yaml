@@ -1117,6 +1117,20 @@ components:
           type: string
         prefault:
           type: boolean
+        disks:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiskConfig"
+        net:
+          type: array
+          items:
+            $ref: "#/components/schemas/NetConfig"
+        fs:
+          type: array
+          items:
+            $ref: "#/components/schemas/FsConfig"
+        vsock:
+          $ref: "#/components/schemas/VsockConfig"
 
     ReceiveMigrationData:
       required:
