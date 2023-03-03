@@ -672,7 +672,9 @@ impl Vmm {
 
         // Now we can restore the rest of the VM.
         if let Some(ref mut vm) = self.vm {
-            vm.restore(snapshot).map_err(VmError::Restore)
+            vm.restore(snapshot).map_err(VmError::Restore)?;
+
+            vm.resume().map_err(VmError::Resume)
         } else {
             Err(VmError::VmNotCreated)
         }
