@@ -300,14 +300,12 @@ pub struct Fs {
 impl Fs {
     /// Create a new virtio-fs device.
     #[allow(clippy::too_many_arguments)]
-    #[allow(unused_variables)]
     pub fn new(
         id: String,
         path: &str,
         tag: &str,
         req_num_queues: usize,
         queue_size: u16,
-        virtiofsd_args: String,
         cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
@@ -319,13 +317,6 @@ impl Fs {
         // Calculate the actual number of queues needed.
         let num_queues = NUM_QUEUE_OFFSET + req_num_queues;
 
-        if !virtiofsd_args.trim().is_empty() {
-            let res = thread::Builder::new()
-                .name("virtiofsd".to_string())
-                .spawn(move ||
-                       { virtiofsd::virtiofsd_ch::start_virtiofsd(&virtiofsd_args); }
-                );
-        }
         // Connect to the vhost-user socket.
         let mut vu = VhostUserHandle::connect_vhost_user(false, path, num_queues as u64, false)?;
 
