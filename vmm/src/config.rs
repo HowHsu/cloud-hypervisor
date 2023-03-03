@@ -1342,13 +1342,6 @@ impl FsConfig {
             .add("socket")
             .add("id")
             .add("pci_segment");
-        parser
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time");
 
         Self::parser_add_virtiofsd(&mut parser);
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
@@ -1373,56 +1366,6 @@ impl FsConfig {
             .unwrap_or_default();
 
         let virtiofsd_args = Self::parse_virtiofsd(&parser);
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseFileSystem)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseFileSystem)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseFileSystem)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseFileSystem)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseFileSystem)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseFileSystem)?
-            .unwrap_or_default();
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
-            })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-        let rate_limiter_config = if bw_tb_config.is_some() || ops_tb_config.is_some() {
-            Some(RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            })
-        } else {
-            None
-        };
 
         Ok(FsConfig {
             tag,
@@ -1432,7 +1375,6 @@ impl FsConfig {
             id,
             pci_segment,
             virtiofsd_args,
-            rate_limiter_config,
         })
     }
 
