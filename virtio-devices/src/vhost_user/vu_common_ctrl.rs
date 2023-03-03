@@ -14,7 +14,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 use std::vec::Vec;
 use vhost::vhost_kern::vhost_binding::{VHOST_F_LOG_ALL, VHOST_VRING_F_LOG};
 use vhost::vhost_user::message::{
@@ -399,6 +400,7 @@ impl VhostUserHandle {
                     }
                     Err(e) => e,
                 };
+                sleep(Duration::from_millis(100));
 
                 if now.elapsed().as_secs() >= 60 {
                     break err;
