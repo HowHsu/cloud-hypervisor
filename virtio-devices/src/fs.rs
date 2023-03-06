@@ -657,7 +657,7 @@ impl Snapshottable for Fs {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.state())
+        Snapshot::new_from_versioned_state(&self.id(), &self.state())
     }
 }
 impl Transportable for Fs {}
