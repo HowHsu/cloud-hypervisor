@@ -221,7 +221,7 @@ pub struct DiskConfig {
     #[serde(default)]
     pub id: Option<String>,
     // For testing use only. Not exposed in API.
-    #[serde(default="default_diskconfig_disable_io_uring")]
+    #[serde(default = "default_diskconfig_disable_io_uring")]
     pub disable_io_uring: bool,
     #[serde(default)]
     pub pci_segment: u16,

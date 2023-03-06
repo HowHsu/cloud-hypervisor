@@ -126,8 +126,7 @@ impl Net {
                 }
 
                 if csum {
-                    avail_features |= 1 << VIRTIO_NET_F_CSUM
-                        | 1 << VIRTIO_NET_F_GUEST_CSUM;
+                    avail_features |= 1 << VIRTIO_NET_F_CSUM | 1 << VIRTIO_NET_F_GUEST_CSUM;
 
                     if tso {
                         avail_features |= 1 << VIRTIO_NET_F_HOST_ECN
@@ -139,8 +138,7 @@ impl Net {
                     }
 
                     if ufo {
-                        avail_features |= 1 << VIRTIO_NET_F_HOST_UFO
-                            | 1 << VIRTIO_NET_F_GUEST_UFO;
+                        avail_features |= 1 << VIRTIO_NET_F_HOST_UFO | 1 << VIRTIO_NET_F_GUEST_UFO;
                     }
                 }
 

@@ -487,8 +487,7 @@ impl Net {
                 }
 
                 if ufo {
-                    avail_features |= 1 << VIRTIO_NET_F_HOST_UFO
-                        | 1 << VIRTIO_NET_F_GUEST_UFO;
+                    avail_features |= 1 << VIRTIO_NET_F_HOST_UFO | 1 << VIRTIO_NET_F_GUEST_UFO;
                 }
             }
 

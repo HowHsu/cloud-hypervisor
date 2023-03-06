@@ -19,7 +19,10 @@ fn main() {
         }
     }
 
-    if let Ok(git_out) = Command::new("git").args(["rev-parse", "--short", "HEAD"]).output() {
+    if let Ok(git_out) = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+    {
         if git_out.status.success() {
             if let Ok(git_out_str) = String::from_utf8(git_out.stdout) {
                 version = format!("{}-{}", version, git_out_str);
