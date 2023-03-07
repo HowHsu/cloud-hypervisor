@@ -78,7 +78,7 @@ enum Error {
 struct Logger {
     output: Mutex<Box<dyn std::io::Write + Send>>,
     start: std::time::Instant,
-    sandboxid: Box<String>,
+    sandbox_id: String,
 }
 
 impl log::Log for Logger {
@@ -97,7 +97,7 @@ impl log::Log for Logger {
         if record.file().is_some() && record.line().is_some() {
             let t = format!(
                 "{} --- {:?} --- <{}> {}:{}:{} -- {}\n",
-                self.sandboxid,
+                self.sandbox_id,
                 duration.as_millis(),
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
@@ -109,7 +109,7 @@ impl log::Log for Logger {
         } else {
             let t = format!(
                 "{} --- {:?} --- <{}> {}:{} -- {}\n",
-                self.sandboxid,
+                self.sandbox_id,
                 duration.as_millis(),
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
@@ -457,17 +457,17 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
             Box::new(std::io::stderr())
         };
 
-    let sandbox_id: Box<String> =
-        if let Some(sandboxid) = cmd_arguments.get_one::<String>("sandbox-id") {
-            Box::new(sandboxid.to_string())
-        } else {
-            Box::new(String::from("cube-hypervisor"))
-        };
+    let sandbox_id: String = if let Some(sandboxid) = cmd_arguments.get_one::<String>("sandbox-id")
+    {
+        sandboxid.to_string()
+    } else {
+        String::from("cube-hypervisor")
+    };
 
     log::set_boxed_logger(Box::new(Logger {
         output: Mutex::new(log_file),
         start: std::time::Instant::now(),
-        sandboxid: sandbox_id,
+        sandbox_id: sandbox_id.clone(),
     }))
     .map(|()| log::set_max_level(log_level))
     .map_err(Error::LoggerSetup)?;
