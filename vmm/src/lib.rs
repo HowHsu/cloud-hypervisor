@@ -274,6 +274,7 @@ pub fn start_vmm_thread(
     #[cfg(feature = "guest_debug")] vm_debug_event: EventFd,
     seccomp_action: &SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    sandbox_id: String,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     #[cfg(feature = "guest_debug")]
     let gdb_hw_breakpoints = hypervisor.get_guest_debug_hw_bps();
@@ -313,6 +314,7 @@ pub fn start_vmm_thread(
                     vmm_seccomp_action,
                     hypervisor,
                     exit_evt,
+                    sandbox_id,
                 )?;
 
                 vmm.setup_signal_handler()?;
@@ -390,6 +392,7 @@ pub struct Vmm {
     signals: Option<Handle>,
     threads: Vec<thread::JoinHandle<()>>,
     pinglog: u32,
+    sandbox_id: String,
 }
 
 impl Vmm {
@@ -478,6 +481,7 @@ impl Vmm {
         seccomp_action: SeccompAction,
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         exit_evt: EventFd,
+        sandbox_id: String,
     ) -> Result<Self> {
         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -522,6 +526,7 @@ impl Vmm {
             signals: None,
             threads: vec![],
             pinglog: Self::DEFAULT_PING_LOG_COUNT,
+            sandbox_id,
         })
     }
 
@@ -572,6 +577,7 @@ impl Vmm {
                         None,
                         None,
                         None,
+                        self.sandbox_id.clone(),
                     )?;
 
                     self.vm = Some(vm);
@@ -684,6 +690,7 @@ impl Vmm {
             &self.seccomp_action,
             self.hypervisor.clone(),
             activate_evt,
+            self.sandbox_id.clone(),
         )?;
         self.vm = Some(vm);
 
@@ -763,6 +770,7 @@ impl Vmm {
             serial_pty,
             console_pty,
             console_resize_pipe,
+            self.sandbox_id.clone(),
         )?;
 
         // And we boot it
@@ -1262,6 +1270,7 @@ impl Vmm {
             true,
             timestamp,
             Some(&snapshot),
+            self.sandbox_id.clone(),
         )
         .map_err(|e| {
             MigratableError::MigrateReceive(anyhow!("Error creating VM from snapshot: {:?}", e))

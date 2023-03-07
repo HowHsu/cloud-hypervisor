@@ -960,6 +960,8 @@ pub struct DeviceManager {
     acpi_platform_addresses: AcpiPlatformAddresses,
 
     snapshot: Option<Snapshot>,
+
+    sandbox_id: String,
 }
 
 impl DeviceManager {
@@ -979,6 +981,7 @@ impl DeviceManager {
         boot_id_list: BTreeSet<String>,
         timestamp: Instant,
         snapshot: Option<Snapshot>,
+        sandbox_id: String,
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
         trace_scoped!("DeviceManager::new");
 
@@ -1107,6 +1110,7 @@ impl DeviceManager {
             pending_activations: Arc::new(Mutex::new(Vec::default())),
             acpi_platform_addresses: AcpiPlatformAddresses::default(),
             snapshot,
+            sandbox_id,
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -2332,6 +2336,7 @@ impl DeviceManager {
                         net_cfg.tso,
                         net_cfg.ufo,
                         net_cfg.csum,
+                        Some(self.sandbox_id.clone()),
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
@@ -2378,6 +2383,7 @@ impl DeviceManager {
                         net_cfg.tso,
                         net_cfg.ufo,
                         net_cfg.csum,
+                        None,
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))

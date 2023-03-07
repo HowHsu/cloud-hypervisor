@@ -557,6 +557,7 @@ impl Net {
         tso: bool,
         ufo: bool,
         csum: bool,
+        #[allow(unused_variables)] sandbox_id: Option<String>,
     ) -> Result<Self> {
         let taps = open_tap(
             if_name,

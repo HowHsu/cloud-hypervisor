@@ -501,6 +501,7 @@ impl Vm {
         restoring: bool,
         timestamp: Instant,
         snapshot: Option<&Snapshot>,
+        sandbox_id: String,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
 
@@ -549,6 +550,7 @@ impl Vm {
             boot_id_list,
             timestamp,
             snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID),
+            sandbox_id,
         )
         .map_err(Error::DeviceManager)?;
 
@@ -728,6 +730,7 @@ impl Vm {
         serial_pty: Option<PtyPair>,
         console_pty: Option<PtyPair>,
         console_resize_pipe: Option<File>,
+        sandbox_id: String,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -776,6 +779,7 @@ impl Vm {
             false,
             timestamp,
             None,
+            sandbox_id,
         )?;
 
         // The device manager must create the devices from here as it is part
@@ -801,6 +805,7 @@ impl Vm {
         seccomp_action: &SeccompAction,
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         activate_evt: EventFd,
+        sandbox_id: String,
     ) -> Result<Self> {
         let timestamp = Instant::now();
 
@@ -843,6 +848,7 @@ impl Vm {
             true,
             timestamp,
             Some(snapshot),
+            sandbox_id,
         )
     }
 
