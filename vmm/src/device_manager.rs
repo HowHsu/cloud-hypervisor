@@ -2521,6 +2521,7 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::RestoreGetState)?,
                 bfs_cfg,
                 None,
+                None,
             )
             .map_err(DeviceManagerError::CreateNativeVirtioFs)?,
         ));
