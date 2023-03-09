@@ -339,6 +339,8 @@ fn virtio_fs_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_utimensat, vec![]),
         (libc::SYS_write, vec![]),
         (libc::SYS_writev, vec![]),
+        (libc::SYS_timerfd_create, vec![]),
+        (libc::SYS_timerfd_settime, vec![]),
     ]
 }
 
