@@ -1318,7 +1318,8 @@ impl FsConfig {
     posix_acl=<posix_acl>,xattrmap=<xattrmap>,announce_submounts=<announce_submounts>\
     cache=<cache>,no_readdirplus=<no_readdirplus>,writeback=<writeback>,\
     allow_direct_io=<allow_direct_io>,rlimit_nofile=<rlimit_nofile>,
-    killpriv_v2=<killpriv_v2>,security_label=<security_label>\"";
+    killpriv_v2=<killpriv_v2>,security_label=<security_label>,ops_size=<ops_size>,\
+    ops_one_time_burst=<ops_one_time_burst>,ops_refill_time=<ops_refill_time>\"";
 
     fn add_frontend_args(parser: &mut OptionParser) {
         parser
@@ -1346,6 +1347,13 @@ impl FsConfig {
             .add("rlimit_nofile")
             .add("killpriv_v2")
             .add("security_label");
+    }
+
+    fn add_ratelimiter_args(parser: &mut OptionParser) {
+        parser
+            .add("ops_size")
+            .add("ops_one_time_burst")
+            .add("ops_refill_time");
     }
 
     fn parse_backendfs(parser: &OptionParser) -> Result<BackendFsConfig> {
@@ -1448,6 +1456,7 @@ impl FsConfig {
         let mut parser = OptionParser::new();
         Self::add_frontend_args(&mut parser);
         Self::add_backend_args(&mut parser);
+        Self::add_ratelimiter_args(&mut parser);
 
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
@@ -1481,9 +1490,41 @@ impl FsConfig {
 
         let mut backendfs_config = None;
         // backend args are ignored if native is false
-        if native {
+        let rate_limiter_config = if native {
             backendfs_config = Some(Self::parse_backendfs(&parser)?);
-        }
+
+            let ops_size = parser
+                .convert("ops_size")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let ops_one_time_burst = parser
+                .convert("ops_one_time_burst")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let ops_refill_time = parser
+                .convert("ops_refill_time")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
+                Some(TokenBucketConfig {
+                    size: ops_size,
+                    one_time_burst: Some(ops_one_time_burst),
+                    refill_time: ops_refill_time,
+                })
+            } else {
+                None
+            };
+            if ops_tb_config.is_some() {
+                Some(RateLimiterConfig {
+                    bandwidth: None,
+                    ops: ops_tb_config,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         Ok(FsConfig {
             tag,
@@ -1493,6 +1534,7 @@ impl FsConfig {
             id,
             pci_segment,
             backendfs_config,
+            rate_limiter_config,
         })
     }
 
