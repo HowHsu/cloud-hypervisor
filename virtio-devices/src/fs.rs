@@ -1,6 +1,7 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use super::RateLimiterConfig;
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::Error as DeviceError;
@@ -14,6 +15,7 @@ use crate::{
 };
 use crate::{GuestMemoryMmap, MmapRegion};
 use anyhow::anyhow;
+use rate_limiter::{RateLimiter, TokenType};
 use seccompiler::SeccompAction;
 use serde::Deserialize;
 use std::fs;
@@ -25,7 +27,7 @@ use std::sync::{Arc, Barrier};
 use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use virtio_queue::{Queue, QueueT};
+use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use virtiofsd::{
     descriptor_utils::{Error as VufDescriptorError, Reader, Writer},
     filesystem::FileSystem,
@@ -193,6 +195,7 @@ struct FsEpollHandler<F: FileSystem + Sync> {
     pause_evt: EventFd,
     server: Arc<Server<F>>,
     cache_handler: Option<CacheHandler>,
+    rate_limiter: Option<RateLimiter>,
 }
 
 // New descriptors are pending on the virtio queue.
@@ -238,6 +241,13 @@ impl<F: FileSystem + Sync> FsEpollHandler<F> {
         let mut used_descs = false;
 
         while let Some(desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) {
+            if let Some(rate_limiter) = &mut self.rate_limiter {
+                if !rate_limiter.consume(1, TokenType::Ops) {
+                    queue.go_to_previous_position();
+                    break;
+                }
+            }
+
             let head_index = desc_chain.head_index();
 
             let reader = Reader::new(desc_chain.memory(), desc_chain.clone())
@@ -341,6 +351,7 @@ pub struct Fs {
     exit_evt: EventFd,
     backendfs_config: BackendFsConfig,
     cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
+    rate_limiter_config: Option<RateLimiterConfig>,
 }
 
 impl Fs {
@@ -357,6 +368,7 @@ impl Fs {
         state: Option<State>,
         backendfs_config: &BackendFsConfig,
         cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
+        rate_limiter_config: Option<RateLimiterConfig>,
     ) -> io::Result<Fs> {
         // Calculate the actual number of queues needed.
         let num_queues = NUM_QUEUE_OFFSET + req_num_queues;
@@ -415,6 +427,7 @@ impl Fs {
             exit_evt,
             backendfs_config: backendfs_config.clone(),
             cache,
+            rate_limiter_config,
         })
     }
 
@@ -557,6 +570,12 @@ impl VirtioDevice for Fs {
             let (_, queue, queue_evt) = queues.remove(0);
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
 
+            let rate_limiter: Option<RateLimiter> = self
+                .rate_limiter_config
+                .map(RateLimiterConfig::try_into)
+                .transpose()
+                .map_err(ActivateError::CreateRateLimiter)?;
+
             let cache_handler = if let Some(cache) = self.cache.as_ref() {
                 let handler = CacheHandler {
                     cache_size: cache.0.len,
@@ -577,6 +596,7 @@ impl VirtioDevice for Fs {
                 pause_evt,
                 server: server.clone(),
                 cache_handler,
+                rate_limiter,
             };
 
             let paused = self.common.paused.clone();
