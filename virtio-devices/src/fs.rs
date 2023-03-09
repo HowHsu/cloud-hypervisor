@@ -200,6 +200,8 @@ struct FsEpollHandler<F: FileSystem + Sync> {
 
 // New descriptors are pending on the virtio queue.
 const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
+// New 'wake up' event from the rate limiter
+const RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
 
 impl<F: FileSystem + Sync> FsEpollHandler<F> {
     fn run(
@@ -210,6 +212,9 @@ impl<F: FileSystem + Sync> FsEpollHandler<F> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
 
         helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
+        if let Some(rate_limiter) = &self.rate_limiter {
+            helper.add_event(rate_limiter.as_raw_fd(), RATE_LIMITER_EVENT)?;
+        }
         helper.run(paused, paused_sync, self)?;
 
         Ok(())
@@ -298,6 +303,24 @@ impl<F: FileSystem + Sync> EpollHelperHandler for FsEpollHandler<F> {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
                 })?;
                 self.handle_event_impl()?
+            }
+            RATE_LIMITER_EVENT => {
+                if let Some(rate_limiter) = &mut self.rate_limiter {
+                    // Upon rate limiter event, call the rate limiter handler
+                    // and restart processing the queue.
+                    rate_limiter.event_handler().map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!(
+                            "Failed to process rate limiter event: {:?}",
+                            e
+                        ))
+                    })?;
+
+                    self.handle_event_impl()?
+                } else {
+                    return Err(EpollHelperError::HandleEvent(anyhow!(
+                        "Unexpected 'RATE_LIMITER_EVENT' when rate_limiter is not enabled."
+                    )));
+                }
             }
             _ => {
                 return Err(EpollHelperError::HandleEvent(anyhow!(
