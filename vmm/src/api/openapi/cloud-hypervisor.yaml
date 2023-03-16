@@ -1134,6 +1134,9 @@ components:
             $ref: "#/components/schemas/FsConfig"
         vsock:
           $ref: "#/components/schemas/VsockConfig"
+        dirty_log:
+          type: boolean
+          default: false
 
     ReceiveMigrationData:
       required:

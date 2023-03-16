@@ -643,6 +643,7 @@ impl Vmm {
             if let Some(fses) = &restore_cfg.fs {
                 vm_config.update_fses(fses);
             }
+            vm_config.memory.dirty_log = restore_cfg.dirty_log;
 
             vm_config
         }));
