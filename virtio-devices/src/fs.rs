@@ -8,7 +8,9 @@ use crate::VirtioInterruptType;
 use crate::{
     ActivateError, ActivateResult, EpollHelper, EpollHelperError, EpollHelperHandler,
     UserspaceMapping, VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt,
-    VirtioSharedMemoryList, EPOLL_HELPER_EVENT_LAST, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1,
+    VirtioSharedMemoryList, EPOLL_HELPER_EVENT_LAST, VIRTIO_F_IN_ORDER, VIRTIO_F_IOMMU_PLATFORM,
+    VIRTIO_F_NOTIFICATION_DATA, VIRTIO_F_ORDER_PLATFORM, VIRTIO_F_RING_INDIRECT_DESC,
+    VIRTIO_F_VERSION_1,
 };
 use crate::{GuestMemoryMmap, MmapRegion};
 use anyhow::anyhow;
@@ -379,7 +381,12 @@ impl Fs {
             )
         } else {
             // Filling device and vring features VMM supports.
-            let mut avail_features: u64 = 1 << VIRTIO_F_VERSION_1;
+            let mut avail_features: u64 = 1 << VIRTIO_F_RING_INDIRECT_DESC
+                | 1 << VIRTIO_F_VERSION_1
+                | 1 << VIRTIO_F_IN_ORDER
+                | 1 << VIRTIO_F_ORDER_PLATFORM
+                | 1 << VIRTIO_F_NOTIFICATION_DATA;
+
             if iommu {
                 avail_features |= 1 << VIRTIO_F_IOMMU_PLATFORM;
             }
@@ -398,7 +405,7 @@ impl Fs {
                 avail_features,
                 acked_features,
                 queue_sizes: vec![queue_size; num_queues],
-                paused_sync: Some(Arc::new(Barrier::new(2))),
+                paused_sync: Some(Arc::new(Barrier::new(num_queues + 1))),
                 min_queues: 1,
                 paused: Arc::new(AtomicBool::new(paused)),
                 ..Default::default()
