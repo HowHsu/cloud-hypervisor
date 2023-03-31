@@ -28,6 +28,14 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::block_signal;
 use vmm_sys_util::terminal::Terminal;
 
+#[macro_use]
+extern crate slog;
+extern crate slog_async;
+extern crate slog_scope;
+extern crate slog_term;
+
+use slog::{o, Drain};
+
 #[derive(Error, Debug)]
 enum Error {
     #[error("Failed to create API EventFd: {0}")]
@@ -76,7 +84,6 @@ enum Error {
 }
 
 struct Logger {
-    output: Mutex<Box<dyn std::io::Write + Send>>,
     start: std::time::Instant,
     sandbox_id: String,
 }
@@ -93,32 +100,32 @@ impl log::Log for Logger {
 
         let now = std::time::Instant::now();
         let duration = now.duration_since(self.start);
+        let log = slog_scope::logger();
 
         if record.file().is_some() && record.line().is_some() {
             let t = format!(
-                "{} --- {:?} --- <{}> {}:{}:{} -- {}\n",
+                " --- {} --- {:?} --- <{}> {}:{}:{} -- {}",
                 self.sandbox_id,
                 duration.as_millis(),
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
                 record.file().unwrap(),
                 record.line().unwrap(),
-                record.args()
+                record.args(),
             );
-            (*(self.output.lock().unwrap())).write(t.as_bytes())
+            slog_info!(log, "{}", t);
         } else {
             let t = format!(
-                "{} --- {:?} --- <{}> {}:{} -- {}\n",
+                " --- {} --- {:?} --- <{}> {}:{} -- {}",
                 self.sandbox_id,
                 duration.as_millis(),
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
                 record.target(),
-                record.args()
+                record.args(),
             );
-            (*(self.output.lock().unwrap())).write(t.as_bytes())
+            slog_info!(log, "{}", t);
         }
-        .ok();
     }
     fn flush(&self) {}
 }
@@ -476,12 +483,21 @@ fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
     };
 
     log::set_boxed_logger(Box::new(Logger {
-        output: Mutex::new(log_file),
         start: std::time::Instant::now(),
         sandbox_id: sandbox_id.clone(),
     }))
     .map(|()| log::set_max_level(log_level))
     .map_err(Error::LoggerSetup)?;
+
+    let decorator = slog_term::PlainSyncDecorator::new(log_file);
+    let drain = slog_term::CompactFormat::new(decorator).build().fuse();
+    let drain = slog_async::Async::new(drain)
+        .chan_size(4096)
+        .thread_name("cube-log".to_string())
+        .build()
+        .fuse();
+    let log = slog::Logger::root(drain, o!());
+    let _guard = slog_scope::set_global_logger(log);
 
     info!("Cube-Hypervisor version {}", env!("BUILT_VERSION"));
 
