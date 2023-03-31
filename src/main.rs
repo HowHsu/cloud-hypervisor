@@ -434,6 +434,17 @@ pub fn default_coredump_limit() -> u64 {
 }
 
 fn start_vmm(cmd_arguments: ArgMatches) -> Result<Option<String>, Error> {
+    // Create dummy socket and dup it to large fd, so that we could trigger
+    // expand_files in kernel. And this tricky work will avoid later multi
+    // thread try to invoke expand_files at same time, there will be lock
+    // contention in expand_files.
+    unsafe {
+        let dummy = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if dummy > 0 {
+            libc::dup2(dummy, 512);
+        }
+    }
+
     let log_level = match cmd_arguments.get_count("v") {
         0 => LevelFilter::Info,
         1 => LevelFilter::Info,
