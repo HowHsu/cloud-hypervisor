@@ -413,6 +413,15 @@ fn create_app(default_vcpus: String, default_memory: String, default_rng: String
             .group("vmm-config"),
     );
 
+    let app = app.arg(
+        Arg::new("snapshot-version")
+            .short('D')
+            .long("snapshot-version")
+            .exclusive(true)
+            .action(clap::ArgAction::SetTrue)
+            .help("snapshot version, restore from different snapshot version is not supported"),
+    );
+
     app
 }
 
@@ -671,6 +680,10 @@ fn main() {
 
     let (default_vcpus, default_memory, default_rng) = prepare_default_values();
     let cmd_arguments = create_app(default_vcpus, default_memory, default_rng).get_matches();
+    if cmd_arguments.get_flag("snapshot-version") {
+        println!("Sanpshot Version: {}", env!("SNAPSHOT_VERSION"));
+        return;
+    }
     let exit_code = match start_vmm(cmd_arguments) {
         Ok(path) => {
             path.map(|s| std::fs::remove_file(s).ok());
