@@ -452,6 +452,8 @@ fn signal_handler_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_sendto, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
+        // Async log.
+        (libc::SYS_sched_yield, vec![]),
     ])
 }
 
@@ -481,6 +483,8 @@ fn pty_foreground_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_setsid, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
+        // Async log.
+        (libc::SYS_sched_yield, vec![]),
     ])
 }
 
@@ -679,6 +683,8 @@ fn vmm_thread_rules(
         (libc::SYS_utimensat, vec![]),
         // to support operations in init_backendfs()
         (libc::SYS_lstat, vec![]),
+        // Async log.
+        (libc::SYS_sched_yield, vec![]),
     ])
 }
 
@@ -796,6 +802,8 @@ fn vcpu_thread_rules(
         (libc::SYS_unlinkat, vec![]),
         (libc::SYS_write, vec![]),
         (libc::SYS_writev, vec![]),
+        // Async log.
+        (libc::SYS_sched_yield, vec![]),
     ])
 }
 
@@ -826,6 +834,8 @@ fn api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
         (libc::SYS_recvmsg, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (libc::SYS_write, vec![]),
+        // Async log.
+        (libc::SYS_sched_yield, vec![]),
     ])
 }
 
