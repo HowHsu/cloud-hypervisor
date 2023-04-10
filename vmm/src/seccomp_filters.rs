@@ -685,6 +685,7 @@ fn vmm_thread_rules(
         (libc::SYS_lstat, vec![]),
         // Async log.
         (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_setsockopt, vec![]),
     ])
 }
 

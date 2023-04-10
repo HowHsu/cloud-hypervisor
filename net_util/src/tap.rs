@@ -18,6 +18,7 @@ use std::net;
 use std::os::raw::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::Duration;
 use thiserror::Error;
 use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref, ioctl_with_val};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
@@ -125,10 +126,12 @@ fn request_file_from_pool<T: Read + Write + ScmSocket>(
         name: if_name.to_string(),
         sandboxId: sandbox_id,
     };
+    let start = std::time::Instant::now();
 
     // Send message
     let body = serde_json::to_vec(&request).map_err(Error::OpenTunJson)?;
     sock.write_all(&body).map_err(Error::OpenTunSendmsg)?;
+    let ts_send = std::time::Instant::now();
 
     let mut fds = [0; 1];
     let mut iovecs = [libc::iovec {
@@ -136,20 +139,33 @@ fn request_file_from_pool<T: Read + Write + ScmSocket>(
         iov_len: buf.len(),
     }];
 
-    let (_, fd_count) = unsafe {
-        sock.recv_with_fds(&mut iovecs, &mut fds)
-            .map_err(Error::OpenTunRecvmsg)?
+    let mut cnt = 0;
+    let fd_count = loop {
+        unsafe {
+            match sock.recv_with_fds(&mut iovecs, &mut fds) {
+                Ok((_, fd_count)) => break fd_count,
+                Err(ref err) if err.errno() == libc::EAGAIN => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    cnt += 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(Error::OpenTunRecvmsg(e));
+                }
+            }
+        };
     };
-
     if fd_count == 0 {
         return Err(Error::OpenTunNoFD);
     }
+    let ts_recv = std::time::Instant::now();
 
     // Dup FD.
     let fd = unsafe { libc::dup(fds[0]) };
     if fd < 0 {
         return Err(Error::OpenTunDupErr(IoError::last_os_error()));
     }
+    let ts_dup = std::time::Instant::now();
 
     // Set nonblock.
     let ret = unsafe {
@@ -161,6 +177,17 @@ fn request_file_from_pool<T: Read + Write + ScmSocket>(
         unsafe { libc::close(fd) };
         return Err(Error::OpenTunSetflErr(IoError::last_os_error()));
     }
+    let ts_fcntl = std::time::Instant::now();
+
+    info!(
+        "Fast request tap recv done, got {} fd after {} try, send {} recv {} dup {} fcntl {}",
+        fd_count,
+        cnt,
+        ts_send.duration_since(start).as_millis(),
+        ts_recv.duration_since(ts_send).as_millis(),
+        ts_dup.duration_since(ts_recv).as_millis(),
+        ts_fcntl.duration_since(ts_dup).as_millis()
+    );
 
     Ok(unsafe { File::from_raw_fd(fd) })
 }
@@ -172,6 +199,10 @@ fn request_from_pool(if_name: &str, sandbox_id: String) -> Result<File> {
     };
 
     let mut sock = UnixStream::connect(path).map_err(Error::OpenTunConnect)?;
+
+    sock.set_nonblocking(true).map_err(Error::OpenTunSetflErr)?;
+    sock.set_write_timeout(Some(Duration::from_millis(1)))
+        .map_err(Error::OpenTunSetflErr)?;
 
     request_file_from_pool(&mut sock, if_name, sandbox_id)
 }
