@@ -1,6 +1,6 @@
 [package]
 name = "cube-hypervisor"
-version = "0.2.1"
+version = "0.4.0"
 authors = ["The Cloud Hypervisor Authors"]
 edition = "2021"
 default-run = "cube-hypervisor"
