@@ -195,7 +195,7 @@ fn request_file_from_pool<T: Read + Write + ScmSocket>(
 fn request_from_pool(if_name: &str, sandbox_id: String) -> Result<File> {
     let path = match env::var("CUBE_TAP_SERV_PATH") {
         Ok(var) => var,
-        Err(_) => "/run/containerd/cubetap.sock".to_string(),
+        Err(_) => "/data/cubelet/cubetap.sock".to_string(),
     };
 
     let mut sock = UnixStream::connect(path).map_err(Error::OpenTunConnect)?;
