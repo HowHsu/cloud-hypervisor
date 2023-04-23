@@ -577,17 +577,6 @@ impl VirtioDevice for Fs {
         let fs = self
             .init_backend_fs(&self.backendfs_config)
             .map_err(ActivateError::ActivateVirtioFs)?;
-        // Test that unshare(CLONE_FS) works, it will be called for each thread.
-        // It's an unprivileged system call but some Docker/Moby versions are
-        // known to reject it via seccomp when CAP_SYS_ADMIN is not given.
-        //
-        // Note that the program is single-threaded here so this syscall has no
-        // visible effect and is safe to make.
-        let ret = unsafe { libc::unshare(libc::CLONE_FS) };
-        if ret == -1 {
-            return Err(ActivateError::ActivateVirtioFs(io::Error::last_os_error()));
-        }
-
         let server = Arc::new(Server::new(fs));
         let mut epoll_threads = Vec::new();
         for i in 0..queues.len() {
