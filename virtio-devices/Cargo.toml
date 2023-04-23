@@ -20,7 +20,7 @@ log = "0.4.17"
 net_gen = { path = "../net_gen" }
 net_util = { path = "../net_util" }
 pci = { path = "../pci" }
-rate_limiter = { path = "../rate_limiter" }
+rate_limiter = { git = "https://github.com/HowHsu/ratelimiter", rev = "4a7bad2b605d" }
 seccompiler = "0.3.0"
 serde = { version = "1.0.151", features = ["derive"] }
 serde_json = "1.0.93"

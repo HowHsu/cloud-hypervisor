@@ -85,7 +85,6 @@ members = [
     "pci",
     "performance-metrics",
     "qcow",
-    "rate_limiter",
     "serial_buffer",
     "test_infra",
     "tracer",

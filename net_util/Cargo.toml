@@ -10,7 +10,7 @@ getrandom = "0.2.8"
 libc = "0.2.139"
 log = "0.4.17"
 net_gen = { path = "../net_gen" }
-rate_limiter = { path = "../rate_limiter" }
+rate_limiter = { git = "https://github.com/HowHsu/ratelimiter", rev = "4a7bad2b605d" }
 serde = "1.0.151"
 thiserror = "1.0.38"
 versionize = "0.1.9"

@@ -995,6 +995,7 @@ dependencies = [
 [[package]]
 name = "rate_limiter"
 version = "0.1.0"
+source = "git+https://github.com/HowHsu/ratelimiter?rev=4a7bad2b605d#4a7bad2b605d891ec2f308d012acfff9f6d57441"
 dependencies = [
  "libc",
  "log",
