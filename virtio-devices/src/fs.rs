@@ -262,12 +262,23 @@ impl<F: FileSystem + Sync> FsEpollHandler<F> {
                 .map_err(Error::QueueWriter)
                 .unwrap();
 
-            let len = self
-                .server
-                .handle_message(reader, writer, cache_handler.as_mut())
-                .map_err(Error::ProcessQueue)
-                .unwrap();
-
+            let len = match self.server.handle_message(
+                reader,
+                writer,
+                cache_handler.as_mut(),
+                &mut self.rate_limiter,
+            ) {
+                Ok(len) => len,
+                Err(VhostUserFsError::RateLimiterReached) => {
+                    self.rate_limiter
+                        .as_mut()
+                        .unwrap()
+                        .manual_replenish(1, TokenType::Ops);
+                    queue.go_to_previous_position();
+                    break;
+                }
+                Err(e) => Err(Error::ProcessQueue(e)).unwrap(),
+            };
             Self::return_descriptor(queue, desc_chain.memory(), head_index, len);
             used_descs = true;
         }
