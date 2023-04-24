@@ -1251,7 +1251,8 @@ impl FsConfig {
     cache=<cache>,no_readdirplus=<no_readdirplus>,writeback=<writeback>,\
     allow_direct_io=<allow_direct_io>,rlimit_nofile=<rlimit_nofile>,
     killpriv_v2=<killpriv_v2>,security_label=<security_label>,ops_size=<ops_size>,\
-    ops_one_time_burst=<ops_one_time_burst>,ops_refill_time=<ops_refill_time>\"";
+    ops_one_time_burst=<ops_one_time_burst>,ops_refill_time=<ops_refill_time>\
+    bw_size=<bw_size>,bw_one_time_burst=<bw_one_time_burst>,bw_refill_time=<bw_refill_time>\"";
 
     fn add_frontend_args(parser: &mut OptionParser) {
         parser
@@ -1284,7 +1285,10 @@ impl FsConfig {
         parser
             .add("ops_size")
             .add("ops_one_time_burst")
-            .add("ops_refill_time");
+            .add("ops_refill_time")
+            .add("bw_size")
+            .add("bw_one_time_burst")
+            .add("bw_refill_time");
     }
 
     fn parse_backendfs(parser: &OptionParser) -> Result<BackendFsConfig> {
@@ -1444,9 +1448,32 @@ impl FsConfig {
             } else {
                 None
             };
-            if ops_tb_config.is_some() {
+
+            let bw_size = parser
+                .convert("bw_size")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let bw_one_time_burst = parser
+                .convert("bw_one_time_burst")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let bw_refill_time = parser
+                .convert("bw_refill_time")
+                .map_err(Error::ParseFileSystem)?
+                .unwrap_or_default();
+            let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
+                Some(TokenBucketConfig {
+                    size: bw_size,
+                    one_time_burst: Some(bw_one_time_burst),
+                    refill_time: bw_refill_time,
+                })
+            } else {
+                None
+            };
+
+            if ops_tb_config.is_some() || bw_tb_config.is_some() {
                 Some(RateLimiterConfig {
-                    bandwidth: None,
+                    bandwidth: bw_tb_config,
                     ops: ops_tb_config,
                 })
             } else {
