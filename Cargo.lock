@@ -1278,6 +1278,7 @@ checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 [[package]]
 name = "rate_limiter"
 version = "0.1.0"
+source = "git+https://github.com/HowHsu/ratelimiter?rev=18b4d487df1f#18b4d487df1f280a93dff607227fe4f0d273321f"
 dependencies = [
  "libc",
  "log",
@@ -2000,7 +2001,7 @@ dependencies = [
  "vhost",
  "virtio-bindings",
  "virtio-queue",
- "virtiofsd",
+ "virtiofsd 1.5.0 (git+https://gitlab.com/HowHsu/virtiofsd?rev=a471d3ca8c08)",
  "vm-allocator",
  "vm-device",
  "vm-memory",
@@ -2033,6 +2034,29 @@ dependencies = [
  "libc",
  "libseccomp-sys",
  "log",
+ "structopt",
+ "syslog",
+ "vhost",
+ "vhost-user-backend",
+ "virtio-bindings",
+ "virtio-queue",
+ "vm-memory",
+ "vmm-sys-util",
+]
+
+[[package]]
+name = "virtiofsd"
+version = "1.5.0"
+source = "git+https://gitlab.com/HowHsu/virtiofsd?rev=a471d3ca8c08#a471d3ca8c08fb20c9919cc097c98efc967799db"
+dependencies = [
+ "bitflags",
+ "capng",
+ "env_logger 0.10.0",
+ "futures",
+ "libc",
+ "libseccomp-sys",
+ "log",
+ "rate_limiter",
  "structopt",
  "syslog",
  "vhost",
@@ -2144,7 +2168,7 @@ dependencies = [
  "vhdx",
  "virtio-devices",
  "virtio-queue",
- "virtiofsd",
+ "virtiofsd 1.5.0 (git+https://gitlab.com/HowHsu/virtiofsd?rev=6b7036ac)",
  "vm-allocator",
  "vm-device",
  "vm-memory",

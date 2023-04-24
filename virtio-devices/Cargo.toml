@@ -37,4 +37,4 @@ vm-memory = { version = "0.10.0", features = ["backend-mmap", "backend-atomic", 
 vm-migration = { path = "../vm-migration" }
 vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = "0.11.1"
-virtiofsd = { git = "https://gitlab.com/HowHsu/virtiofsd", rev = "6b7036ac" }
+virtiofsd = { git = "https://gitlab.com/HowHsu/virtiofsd", rev = "a471d3ca8c08" }
