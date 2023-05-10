@@ -371,13 +371,13 @@ impl RateLimiter {
         self.timer_active = true;
     }
 
-    /// Attempts to consume tokens and returns whether that is possible.
+    /// Attempts to consume tokens and returns the result.
     ///
     /// If rate limiting is disabled on provided `token_type`, this function will always succeed.
-    pub fn consume(&mut self, tokens: u64, token_type: TokenType) -> bool {
+    pub fn consume(&mut self, tokens: u64, token_type: TokenType) -> BucketReduction {
         // If the timer is active, we can't consume tokens from any bucket and the function fails.
         if self.timer_active {
-            return false;
+            return BucketReduction::Failure;
         }
 
         // Identify the required token bucket.
@@ -396,10 +396,10 @@ impl RateLimiter {
                     if !self.timer_active {
                         self.activate_timer(TIMER_REFILL_DUR);
                     }
-                    false
+                    BucketReduction::Failure
                 }
                 // The operation succeeded and further calls can be made.
-                BucketReduction::Success => true,
+                BucketReduction::Success => BucketReduction::Success,
                 // The operation succeeded as the tokens have been consumed
                 // but the timer still needs to be armed.
                 BucketReduction::OverConsumption(ratio) => {
@@ -410,13 +410,13 @@ impl RateLimiter {
                     // further calls to the rate limiter for
                     // `ratio * refill_time` milliseconds.
                     self.activate_timer(Duration::from_millis((ratio * refill_time as f64) as u64));
-                    true
+                    BucketReduction::OverConsumption(ratio)
                 }
             }
         } else {
             // If bucket is not present rate limiting is disabled on token type,
             // consume() will always succeed.
-            true
+            BucketReduction::Success
         }
     }
 
