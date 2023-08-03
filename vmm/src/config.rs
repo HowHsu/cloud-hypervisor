@@ -1484,6 +1484,7 @@ impl FsConfig {
             rlimit_nofile,
             killpriv_v2,
             security_label,
+            allowed_dirs: "".to_string(),
         })
     }
 
@@ -1575,10 +1576,12 @@ impl FsConfig {
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.backendfs_config.is_some() {
+            info!("backendfs config");
             if self.socket.to_str() != Some("") {
                 return Err(ValidationError::NativeVirtioFsSocket);
             }
         } else {
+            info!("normal config");
             if self.socket.to_str() == Some("") {
                 return Err(ValidationError::VhostUserMissingSocket);
             }

@@ -361,6 +361,9 @@ pub struct BackendFsConfig {
     pub killpriv_v2: bool,
     #[serde(default)]
     pub security_label: bool,
+     #[serde(default)]
+    pub allowed_dirs: String,
+
 }
 
 // SAFETY: only a series of integers
@@ -577,7 +580,7 @@ impl VirtioDevice for Fs {
         let fs = self
             .init_backend_fs(&self.backendfs_config)
             .map_err(ActivateError::ActivateVirtioFs)?;
-        let server = Arc::new(Server::new(fs));
+        let server = Arc::new(Server::new(fs, &self.backendfs_config.allowed_dirs));
         let mut epoll_threads = Vec::new();
         for i in 0..queues.len() {
             let (_, queue, queue_evt) = queues.remove(0);
